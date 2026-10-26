@@ -13,11 +13,14 @@
   <modules>
     <module>dq-client</module>
     <module>dq-jobs</module>
+    <module>dq-anomaly-worker</module>
   </modules>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <java.release>11</java.release>
+    <delta.version>3.2.0</delta.version>
+    <breeze.version>2.1.0</breeze.version>
     <scala.binary.version>2.12</scala.binary.version>
     <!-- Khớp với Spark 3.5.1 (spark-parent_2.12:3.5.1) -->
     <scala.version>2.12.18</scala.version>
@@ -58,6 +61,22 @@
         <artifactId>spark-sql_${scala.binary.version}</artifactId>
         <version>${spark.version}</version>
         <scope>provided</scope>
+      </dependency>
+      <!-- Delta 3.2.0 (Spark 3.5 / Scala 2.12) -->
+      <dependency>
+        <groupId>io.delta</groupId>
+        <artifactId>delta-spark_${scala.binary.version}</artifactId>
+        <version>${delta.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.delta</groupId>
+        <artifactId>delta-storage</artifactId>
+        <version>${delta.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.scalanlp</groupId>
+        <artifactId>breeze_${scala.binary.version}</artifactId>
+        <version>${breeze.version}</version>
       </dependency>
       <!-- Deequ dùng mllib (KLL, histogram). Spark distribution đã có sẵn -> provided -->
       <dependency>
@@ -142,11 +161,6 @@
               <goals><goal>test</goal></goals>
             </execution>
           </executions>
-        </plugin>
-        <plugin>
-          <groupId>org.apache.maven.plugins</groupId>
-          <artifactId>maven-shade-plugin</artifactId>
-          <version>3.6.0</version>
         </plugin>
       </plugins>
     </pluginManagement>

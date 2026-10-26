@@ -1,174 +1,249 @@
 package dqplatform.client
 
-import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.functions.{col, lit, to_timestamp}
+import org.apache.spark.sql.functions.{col, lit, to_date, to_timestamp}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.nio.file.{Files, Paths}
+import java.util.UUID
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 
-/** Chạy suite thật của repo qua DQClient với service giả: suite -> Deequ -> quarantine -> payload. */
+/** DQClient against an in-memory service double: real Delta tables, real Spark, consumer-visible results. */
 class DQClientSpec extends AnyFunSuite with Matchers with SparkTestSession {
 
-  private val mapper = new ObjectMapper()
-  private val suiteFile = mapper.readTree(
-    new String(Files.readAllBytes(Paths.get("../../suites/silver_transactions.json")), "UTF-8"))
+  private val Hash0 = "sha256:" + "0" * 64
+  private val ExecId = UUID.randomUUID().toString
+  private val AttemptId = UUID.randomUUID().toString
 
-  private class FakeService(verdict: String = "WARN", getFails: Boolean = false, postFails: Boolean = false,
-                            failStatus: Option[Int] = None) extends ServiceApi {
-    var posted: Option[JsonNode] = None
+  private final class Fixture(failPostOnce: Boolean = false, acceptedBeforeLoss: Boolean = true) {
+    val dir = Files.createTempDirectory("dqclient").toString
+    val posted = mutable.Buffer[JsonNode]()
+    val calls = mutable.Buffer[String]()
+    var stored: Option[(JsonNode, JsonNode)] = None
+    var failPost = failPostOnce
 
-    override def getSuite(dataset: String): JsonNode = {
-      if (getFails) throw new ServiceException(failStatus.fold("connection refused")(s => s"HTTP $s"), failStatus)
-      val n = mapper.createObjectNode()
-      n.put("dataset", dataset)
-      n.put("version", 3)
-      n.set[JsonNode]("suite", suiteFile.get("suite"))
-      n
+    private def table(name: String): String = {
+      val uri = s"$dir/$name"
+      import spark.implicits._
+      Seq(("x", 1L)).toDF("v", "id").write.format("delta").save(uri)
+      uri
+    }
+    val silver = table("silver")
+    val quarantine = table("quarantine")
+
+    def rule(id: String, check: String, stage: String, action: String, name: String, vt: String): JsonNode = {
+      val r = Json.node()
+      r.put("rule_id", id).put("metric_definition_hash", Hash0).put("measurement_definition_hash", Hash0)
+      r.put("metric_name", name).put("value_type", vt)
+      val c = Canonical.parse(check)
+      r.put("kind", c.get("kind").asText()).set[JsonNode]("resolved_check", c)
+      r.put("action", action).put("required", true)
+      r
     }
 
-    override def postRun(payload: JsonNode): JsonNode = {
-      if (postFails) throw new ServiceException("HTTP 503")
-      posted = Some(payload)
-      mapper.readTree(s"""{"run_id": "x", "verdict": "$verdict", "reasons": ["[warn][completeness] r"],
-        "dimensions": {"validity": {"evaluated": 6, "passed": 4}}}""")
+    def binding(stage: String, role: String, rules: JsonNode*): JsonNode = {
+      val b = Json.node()
+      b.put("scope", "PARTITION").put("stage", stage).put("reference_role", role)
+      val a = b.putArray("rules"); rules.foreach(a.add)
+      b
     }
-  }
 
-  private def client(service: ServiceApi, mode: String = "enforce", failClosed: Boolean = true) =
-    new DQClient(spark, DQConfig("http://unused", "silver.transactions", mode, failClosed, 10, "spec_job"), service)
-
-  private val params = Map(
-    "partition_start" -> "2026-10-17 00:00:00",
-    "partition_end" -> "2026-10-18 00:00:00",
-    "source_row_count" -> "7")
-
-  /** TX1 hợp lệ, TX2..TX7 mỗi dòng vi phạm đúng một rule row-level. */
-  private lazy val batch: DataFrame = spark.createDataFrame(Seq(
-    ("TX1", "SUB1", "84912345678", "10000", "SUCCESS", "HN", "2026-10-17 23:30:00"),
-    ("TX2", "SUB2", "12345", "10000", "SUCCESS", "HN", "2026-10-17 01:00:00"),
-    ("TX3", null, "84912345679", "10000", "FAILED", "HN", "2026-10-17 02:00:00"),
-    ("TX4", "SUB4", "84912345670", "-5", "SUCCESS", "HN", "2026-10-17 03:00:00"),
-    ("TX5", "SUB5", "84912345671", "10000", "PENDING", "HN", "2026-10-17 04:00:00"),
-    ("TX6", "SUB6", "84912345672", "10000", "SUCCESS", "HN", "2026-10-16 10:00:00"),
-    ("TX7", "SUB7", "84912345673", "50k", "SUCCESS", "HN", "2026-10-17 05:00:00")
-  )).toDF("transaction_id", "subscriber_id", "msisdn", "amount", "status", "province_code", "event_time")
-    .withColumn("amount", col("amount").cast("decimal(18,2)"))
-    .withColumn("event_time", to_timestamp(col("event_time")))
-    .withColumn("dt", lit("2026-10-17"))
-
-  test("kết quả từng rule, quarantine theo rule id, payload gửi service") {
-    val service = new FakeService()
-    val res = client(service).validate(batch, "dt=2026-10-17", params)
-
-    val byId = res.results.map(r => r.ruleId -> r).toMap
-    byId.keySet should have size 21
-    def status(id: String) = byId(id).status
-
-    Seq("row_count_reconcile", "transaction_id_not_null", "msisdn_not_null", "status_not_null", "event_time_not_null",
-      "province_code_completeness", "transaction_id_unique", "business_duplicate", "schema_exact", "amount_type",
-      "event_time_type", "freshness_end_of_day").foreach(id => withClue(id)(status(id) shouldBe RuleResult.Passed))
-    Seq("row_count_min", "subscriber_id_not_null", "amount_not_null", "msisdn_format", "amount_range", "status_domain",
-      "msisdn_carrier_prefix", "amount_mean", "event_time_in_partition")
-      .foreach(id => withClue(id)(status(id) shouldBe RuleResult.Failed))
-
-    byId("row_count_min").metricValue shouldBe Some(7.0)
-    byId("msisdn_format").threshold shouldBe Some(0.97)
-    byId("msisdn_format").metricValue.get shouldBe (6.0 / 7 +- 1e-9)
-    Seq("subscriber_id_not_null", "amount_not_null", "msisdn_format", "amount_range", "status_domain",
-      "event_time_in_partition").foreach(id => withClue(id)(byId(id).failedRows shouldBe Some(1L)))
-    byId("transaction_id_not_null").failedRows shouldBe Some(0L)
-    byId("msisdn_carrier_prefix").failedRows shouldBe None // không row_level -> không vào quarantine
-
-    res.verdict shouldBe "WARN"
-    res.quarantinedRows shouldBe 6
-    res.validDf.select("transaction_id").collect().map(_.getString(0)) shouldBe Array("TX1")
-    res.validDf.columns should not contain RowLevel.ErrorsColumn
-    res.validDf.columns.exists(_.startsWith(DeequChecks.ColumnPrefix)) shouldBe false
-    res.quarantineDf.get.select("transaction_id", RowLevel.ErrorsColumn).collect()
-      .map(r => r.getString(0) -> r.getSeq[String](1)).toMap shouldBe Map(
-      "TX2" -> Seq("msisdn_format"),
-      "TX3" -> Seq("subscriber_id_not_null"),
-      "TX4" -> Seq("amount_range"),
-      "TX5" -> Seq("status_domain"),
-      "TX6" -> Seq("event_time_in_partition"),
-      "TX7" -> Seq("amount_not_null"))
-
-    val p = service.posted.get
-    p.get("client").asText shouldBe "scala"
-    p.get("engine").asText shouldBe "deequ-2.0.21-spark-3.5"
-    p.get("suite_version").asInt shouldBe 3
-    p.get("row_count").asLong shouldBe 7
-    p.get("quarantined_rows").asLong shouldBe 6
-    p.get("parameters").fieldNames().asScala.toSet shouldBe params.keySet // không lộ tên temp view
-    p.get("results").size shouldBe 21
-    // view của client tên dq_batch_<run_id>, run_id bắt đầu bằng job name
-    spark.catalog.listTables().collect().map(_.name).filter(_.startsWith("dq_batch_spec_job")) shouldBe empty
-  }
-
-  test("verdict FAIL: enforce không publish, monitor hạ xuống WARN") {
-    client(new FakeService("FAIL")).validate(batch, "dt=2026-10-17", params).shouldPublish shouldBe false
-    val monitored = client(new FakeService("FAIL"), mode = "monitor").validate(batch, "dt=2026-10-17", params)
-    monitored.verdict shouldBe "WARN"
-    monitored.shouldPublish shouldBe true
-  }
-
-  test("service lỗi: fail-closed ném DQFailedException, fail-open trả SKIPPED với dữ liệu nguyên vẹn") {
-    intercept[DQFailedException](client(new FakeService(getFails = true)).validate(batch, null, params))
-      .getMessage should include("connection refused")
-    intercept[DQFailedException](client(new FakeService(postFails = true)).validate(batch, null, params))
-      .getMessage should include("503")
-
-    val skipped = client(new FakeService(getFails = true), failClosed = false).validate(batch, null, params)
-    skipped.verdict shouldBe "SKIPPED"
-    skipped.shouldPublish shouldBe true
-    skipped.validDf.count() shouldBe 7
-    skipped.quarantineDf shouldBe None
-  }
-
-  test("fail-open không áp dụng cho 4xx (sai token, chưa có suite): vẫn ném DQFailedException") {
-    Seq(401, 404).foreach { status =>
-      val e = intercept[DQFailedException](
-        client(new FakeService(getFails = true, failStatus = Some(status)), failClosed = false).validate(batch, null, params))
-      e.getMessage should include(s"HTTP $status")
+    def plan(manifest: RuntimeVersions): JsonNode = {
+      val p = Json.node()
+      p.put("execution_id", ExecId).put("dataset_id", "ds").put("workflow", "WRITE_GATE").put("plan_hash", Hash0)
+      p.putObject("suite_revision").put("revision_id", UUID.randomUUID().toString)
+      p.putObject("policy_revision").put("revision_id", UUID.randomUUID().toString)
+      p.putObject("partition_values").put("dt", "2026-10-20")
+      p.putObject("parameters").put("k", "v")
+      p.putObject("candidate_locations").put("execution_root", s"$dir/cand/$ExecId")
+      val m = manifest.toJson; m.put("format", "dq-compat-v1")
+      p.putObject("compat_manifest").set[JsonNode]("payload", m)
+      val sb = p.putArray("stage_bindings")
+      sb.add(binding("RAW", "raw", rule("raw_rows", """{"kind":"size"}""", "RAW", "OBSERVE", "Size", "INTEGER")))
+      sb.add(binding("CANDIDATE", "candidate",
+        rule("amount_range", """{"kind":"range","column":"amount","min":"0","max":"100"}""", "CANDIDATE", "QUARANTINE", "Compliance", "DECIMAL"),
+        rule("event_in_partition", """{"kind":"sql_predicate","columns":["event_time"],"predicate":"event_time IS NOT NULL AND event_time >= TIMESTAMP '2026-10-20 00:00:00' AND event_time < TIMESTAMP '2026-10-21 00:00:00'"}""", "CANDIDATE", "QUARANTINE", "Compliance", "DECIMAL"),
+        rule("value_complete", """{"kind":"complete","column":"value"}""", "CANDIDATE", "QUARANTINE", "Completeness", "DECIMAL")))
+      sb.add(binding("CLEAN", "classified_clean", rule("clean_rows", """{"kind":"size"}""", "CLEAN", "BLOCK", "Size", "INTEGER")))
+      p
     }
-    client(new FakeService(getFails = true, failStatus = Some(503)), failClosed = false)
-      .validate(batch, null, params).verdict shouldBe "SKIPPED"
+
+    // test classpath runs from class directories, so the real jar probe is replaced by a fixed attestation
+    var manifest: RuntimeVersions = RuntimeVersions("3.5.1", "2.12.18", 17L, "3.3.4",
+      RuntimeVersions.JarKeys.map(k => k -> ("sha256:" + "a" * 64)).toMap)
+
+    val api: ServiceApi = new ServiceApi {
+      def request(method: String, path: Seq[String], query: Map[String, String], body: Option[JsonNode],
+                  idem: Option[String]): JsonNode = {
+        calls += s"$method /${path.drop(2).mkString("/")}"
+        val n = Json.node()
+        (method, path.drop(2)) match {
+          case ("GET", Seq("datasets", _)) =>
+            val reg = n.putObject("registration")
+            reg.putObject("silver").put("uri", silver)
+            reg.putObject("quarantine").put("uri", quarantine)
+            reg.put("history_context", "ctx")
+            n
+          case ("POST", Seq("executions")) =>
+            body.get.get("partition_values").get("dt").asText() shouldBe "2026-10-20"
+            body.get.get("target_bases").get("silver").get("version").asLong() shouldBe 0L
+            n.set[JsonNode]("plan", plan(manifest)); n
+          case ("POST", Seq("executions", _, "attempts")) =>
+            n.putObject("attempt").put("attempt_id", AttemptId); n
+          case ("POST", Seq("executions", _, "attempts", _, "fail")) => posted += body.get; n
+          case ("POST", Seq("executions", _, "reports")) =>
+            val b = Canonical.parse(Canonical.string(body.get))
+            if (failPost) { failPost = false; if (acceptedBeforeLoss) stored = Some(b -> accepted(b)); throw new ServiceException("SERVICE_UNAVAILABLE", 0) }
+            posted += b
+            accepted(b)
+          case ("GET", Seq("executions", _, "report")) =>
+            stored match {
+              case Some((_, a)) => n.set[JsonNode]("accepted", a); n
+              case None => throw new ServiceException("SERVICE_UNAVAILABLE", 0)
+            }
+        }
+      }
+      private def accepted(b: JsonNode): JsonNode = {
+        val a = Json.node(); a.put("report_hash", Canonical.hash(b)); a.putNull("decision"); a
+      }
+    }
+
+    def client(versions: () => RuntimeVersions = () => manifest) =
+      new DQClient(spark, DQConfig("http://unused", 5, "ds", "default", UUID.randomUUID().toString, "run-1", None, s"$dir/state"),
+        api, versions)
   }
 
-  test("cache: client chỉ gỡ cache do mình tạo; gỡ khi lỗi và khi gọi release()") {
-    import org.apache.spark.storage.StorageLevel
-    val fresh = batch.where("amount IS NULL OR amount IS NOT NULL") // plan riêng, chưa cache
-    fresh.storageLevel shouldBe StorageLevel.NONE
-
-    val res = client(new FakeService()).validate(fresh, null, params)
-    fresh.storageLevel should not be StorageLevel.NONE
-    res.release()
-    fresh.storageLevel shouldBe StorageLevel.NONE
-
-    intercept[IllegalArgumentException](client(new FakeService()).validate(fresh, null, Map.empty[String, String]))
-    fresh.storageLevel shouldBe StorageLevel.NONE
-
-    val jobCached = batch.where("transaction_id IS NOT NULL").cache() // job tự cache -> client không gỡ
-    client(new FakeService()).validate(jobCached, null, params).release()
-    jobCached.storageLevel should not be StorageLevel.NONE
-    jobCached.unpersist()
+  private def source: DataFrame = {
+    import spark.implicits._
+    (1 to 100).map { i =>
+      (i.toLong, if (i == 1 || i == 2) null else "ok", if (i == 1 || i == 3) BigDecimal(-1) else BigDecimal(10),
+        if (i == 1) "2026-10-19 23:00:00" else "2026-10-20 12:00:00")
+    }.toDF("id", "value", "amount", "ts")
+      .select(col("id"), col("value"), col("amount").cast("decimal(18,2)").as("amount"),
+        to_timestamp(col("ts")).as("event_time"), to_date(lit("2026-10-20")).as("dt"))
   }
 
-  test("job thiếu suite parameter -> lỗi rõ ràng, không gửi run") {
-    val service = new FakeService()
-    intercept[IllegalArgumentException](client(service).validate(batch, null, params - "source_row_count"))
-      .getMessage should include("source_row_count")
-    service.posted shouldBe None
+  private def results(report: JsonNode): Map[String, JsonNode] =
+    report.get("results").elements().asScala.map(r => r.get("rule_id").asText() -> r).toMap
+
+  private def pinned(ref: JsonNode): DataFrame =
+    spark.read.format("delta").option("versionAsOf", ref.get("version").asLong()).load(ref.get("uri").asText())
+
+  test("evaluate pins raw/classified candidates and reports exact counts; submit sends the stored bytes") {
+    val f = new Fixture()
+    val c = f.client()
+    val h = c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z"))
+    val ev = c.evaluate(h, source)
+    val r = ev.report
+
+    r.get("candidate_rows").asLong() shouldBe 100L
+    r.get("valid_rows").asLong() shouldBe 97L
+    r.get("quarantine_rows").asLong() shouldBe 3L
+    r.get("classification_status").asText() shouldBe "COMPLETE"
+    r.get("clean_selector").asText() shouldBe "size(_dq_errors)=0"
+    r.get("raw_reference").get("uri").asText() shouldBe s"${f.dir}/cand/$ExecId/$AttemptId/raw"
+    r.get("classified_reference").get("uri").asText() shouldBe s"${f.dir}/cand/$ExecId/$AttemptId/classified"
+    r.get("raw_reference").get("version").asLong() shouldBe 0L
+
+    val res = results(r)
+    res("raw_rows").get("metric_value").asLong() shouldBe 100L
+    res("clean_rows").get("metric_value").asLong() shouldBe 97L
+    res("amount_range").get("failed_rows").asLong() shouldBe 2L
+    res("value_complete").get("failed_rows").asLong() shouldBe 2L
+    res("event_in_partition").get("failed_rows").asLong() shouldBe 1L
+
+    val classified = pinned(r.get("classified_reference"))
+    classified.filter("size(_dq_errors) > 0").select("id").collect().map(_.getLong(0)).toSet shouldBe Set(1L, 2L, 3L)
+    classified.filter("id = 1").head().getSeq[String](classified.columns.indexOf("_dq_errors")) shouldBe
+      Seq("amount_range", "event_in_partition", "value_complete")
+
+    val accepted = c.submit(ev)
+    f.posted.last.toString shouldBe Canonical.parse(new String(Files.readAllBytes(Paths.get(ev.reportFile)), "UTF-8")).toString
+    accepted.get("report_hash").asText() shouldBe Canonical.hash(r)
+    spark.sessionState.catalog.listLocalTempViews("*").map(_.table).filter(_.startsWith("dq_batch_")) shouldBe empty
   }
 
-  test("validateForPython: nhận java.util.Map, ghi client = python") {
-    val service = new FakeService()
-    val res = client(service).validateForPython(batch, "dt=2026-10-17", params.asJava)
-    service.posted.get.get("client").asText shouldBe "python"
-    res.reasonsJava.asScala shouldBe Seq("[warn][completeness] r")
-    res.suiteVersionOrNull shouldBe 3
+  test("retrying evaluate for the same attempt reuses the stored candidate; it never rewrites") {
+    val f = new Fixture()
+    val c = f.client()
+    val h = c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z"))
+    val first = c.evaluate(h, source)
+    val again = c.evaluate(h, source.limit(5))
+    again.report.get("candidate_rows").asLong() shouldBe 100L
+    Canonical.bytes(again.report) shouldBe Canonical.bytes(first.report)
+    pinned(again.report.get("raw_reference")).count() shouldBe 100L
+  }
+
+  test("lost response after acceptance: submit reads the stored report instead of resending") {
+    val f = new Fixture(failPostOnce = true)
+    val c = f.client()
+    val h = c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z"))
+    val ev = c.evaluate(h, source)
+    val accepted = c.submit(ev)
+    accepted.get("report_hash").asText() shouldBe Canonical.hash(ev.report)
+    f.posted.filter(_.has("results")) shouldBe empty
+    f.calls.count(_ == "POST /executions/" + ExecId + "/reports") shouldBe 1
+  }
+
+  test("service unreachable and nothing stored: identical bytes are resent once") {
+    val f = new Fixture(failPostOnce = true, acceptedBeforeLoss = false)
+    val c = f.client()
+    val h = c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z"))
+    val ev = c.evaluate(h, source)
+    c.submit(ev).get("report_hash").asText() shouldBe Canonical.hash(ev.report)
+    f.posted.size shouldBe 1
+  }
+
+  test("runtime mismatch retires the attempt before any candidate is materialized") {
+    val f = new Fixture()
+    val bad = f.manifest.copy(jars = f.manifest.jars.updated("deequ", "sha256:" + "f" * 64))
+    val c = f.client(() => bad)
+    val e = intercept[DQFailedException](
+      c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z")))
+    e.code shouldBe "RUNTIME_MISMATCH"
+    val fail = f.posted.last
+    fail.get("error").get("params").get("component").asText() shouldBe "jars.deequ"
+    fail.get("process_stop").get("confirmed_stopped").asBoolean() shouldBe false
+    Files.exists(Paths.get(s"${f.dir}/cand")) shouldBe false
+  }
+
+  test("candidate with another partition is refused before writing") {
+    val f = new Fixture()
+    val c = f.client()
+    val h = c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z"))
+    val wrong = source.withColumn("dt", to_date(lit("2026-10-21")))
+    intercept[ProtocolException](c.evaluate(h, wrong)).code shouldBe "PARTITION_MISMATCH"
+    Files.exists(Paths.get(s"${f.dir}/cand")) shouldBe false
+  }
+
+  test("PyBridge round-trips handle and evaluation through JSON") {
+    val f = new Fixture()
+    val c = f.client()
+    val h = c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z"))
+    val ev = c.evaluate(h, source)
+    val again = CandidateEvaluation.fromJson(Canonical.parse(Canonical.string(ev.toJson)), spark.sessionState.newHadoopConf())
+    Canonical.bytes(again.handle.toJson) shouldBe Canonical.bytes(ev.handle.toJson)
+    Canonical.bytes(again.report) shouldBe Canonical.bytes(ev.report)
+  }
+
+  test("file:// state dir: evaluate resumes the stored report and submit posts its exact bytes") {
+    val f = new Fixture()
+    val stateDir = Paths.get(f.dir, "uri-state").toUri.toString.stripSuffix("/")
+    val c = new DQClient(spark, DQConfig("http://unused", 5, "ds", "default", UUID.randomUUID().toString, "run-1", None, stateDir),
+      f.api, () => f.manifest)
+    val h = c.startWrite(Map("dt" -> "2026-10-20"), Map("k" -> "v"), java.time.Instant.parse("2026-10-20T12:00:00Z"))
+    val first = c.evaluate(h, source)
+    first.reportFile should startWith (new org.apache.hadoop.fs.Path(stateDir).toString)
+    val again = c.evaluate(h, source.limit(5))
+    Canonical.bytes(again.report) shouldBe Canonical.bytes(first.report)
+    c.submit(again)
+    val stored = Files.readAllBytes(Paths.get(new java.net.URI(first.reportFile)))
+    Canonical.bytes(f.posted.last) shouldBe stored
+    Files.list(Paths.get(new java.net.URI(first.reportFile)).getParent).iterator().asScala
+      .map(_.getFileName.toString).filter(_.startsWith(".tmp")).toList shouldBe empty
   }
 }

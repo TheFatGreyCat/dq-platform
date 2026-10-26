@@ -1,114 +1,119 @@
 name: dq-platform
 
-# Demo: Data Quality Service (control plane) + Spark job (data plane) dùng Deequ.
-#   docker compose up -d postgres dq-service
-#   docker compose run --rm spark-gen-data
-#   docker compose run --rm spark-bronze-to-silver         # job Python  -> silver/
-#   docker compose run --rm spark-bronze-to-silver-scala   # job Scala   -> silver_scala/
+# Hệ thống dev/test cô lập. Mọi giá trị bí mật nằm trong file dưới ${DQ_SECRETS_DIR}
+# (scripts/run_acceptance.py sinh thư mục này). Không có token mặc định, không publish port cố định.
+#   DQ_SECRETS_DIR=/abs/secrets docker compose -p <project> up -d --build postgres minio dq-service
 
 x-spark-common: &spark-common
   build:
-    context: .                   # cần jvm/ và suites/ để build dq-platform.jar
+    context: .
     dockerfile: spark/Dockerfile
+    args:
+      HADOOP_VERSION: ${HADOOP_VERSION:?HADOOP_VERSION là bắt buộc}
   image: dq-demo/spark-deequ:3.5.1
-  depends_on:
-    dq-service:
-      condition: service_healthy
   environment:
-    DQ_API_TOKEN: ${DQ_API_TOKEN:-changeme-dev-token}
+    DQ_RUN_KEY: ${DQ_RUN_KEY:-}
+  secrets: [minio_user, minio_password, job_token]
   volumes:
     - ./spark/jobs:/opt/dq/jobs:ro
     - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
-    - lake:/data/lake            # giả lập HDFS/S3: bronze, silver, quarantine
   networks: [dq]
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_DB: dq
       POSTGRES_USER: dq
-      POSTGRES_PASSWORD: dq
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    configs:
+      - source: pg_init
+        target: /docker-entrypoint-initdb.d/01-init.sh
     volumes:
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./postgres:/dq-sql:ro
       - pgdata:/var/lib/postgresql/data
-    ports: ["5432:5432"]
+      # init.sql dùng \ir migrations/...; psql chạy với -f từ /dq-sql
+    ports: ["5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U dq -d dq"]
       interval: 5s
-      retries: 10
+      retries: 20
+    networks: [dq]
+
+  minio:
+    image: ${MINIO_IMAGE:?MINIO_IMAGE (đã pin digest) là bắt buộc}
+    entrypoint: ["sh", "-c", "MINIO_ROOT_USER=$$(cat /run/secrets/minio_user) MINIO_ROOT_PASSWORD=$$(cat /run/secrets/minio_password) exec minio server /data"]
+    secrets: [minio_user, minio_password]
+    volumes:
+      - miniodata:/data
+    ports: ["9000"]
     networks: [dq]
 
   dq-service:
-    build: ./dq-service
-    image: dq-demo/dq-service:0.1
+    build:
+      context: .
+      dockerfile: dq-service/Dockerfile
+    image: dq-demo/dq-service:0.2
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg://dq:dq@postgres:5432/dq
-      # Giá trị mặc định chỉ cho demo local. Môi trường thật: bắt buộc đặt qua secret, service không start nếu rỗng.
-      DQ_API_TOKEN: ${DQ_API_TOKEN:-changeme-dev-token}       # job Spark: đọc suite, gửi run
-      DQ_ADMIN_TOKEN: ${DQ_ADMIN_TOKEN:-changeme-admin-token} # sửa rule (PUT /suites), không cấp cho job
-      SEED_DIR: /app/suites
-      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}   # Slack/Teams/Telegram webhook, để trống = chỉ log
-    volumes:
-      - ./suites:/app/suites:ro
-    ports: ["8000:8000"]
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DQ_TOKEN_REGISTRY_FILE: /run/secrets/token_registry.json
+      DQ_ALERT_WEBHOOK_URL: ${DQ_ALERT_WEBHOOK_URL:-}
+      DQ_RESTORE_MODE: ${DQ_RESTORE_MODE:-0}
+    secrets: [database_url, token_registry.json]
+    ports: ["8000"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 5s
-      retries: 10
+      retries: 20
     networks: [dq]
 
-  # Sinh dữ liệu bronze mẫu (có lẫn ~3% bản ghi lỗi)
-  spark-gen-data:
-    <<: *spark-common
-    profiles: [jobs]
-    command: >
-      /opt/spark/bin/spark-submit /opt/dq/jobs/generate_bronze.py
-      --out /data/lake/bronze/transactions --dt ${DT:-2026-10-17} --rows 10000 --bad-ratio ${BAD_RATIO:-0.03}
+  frontend:
+    profiles: [ui]
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: dq-demo/dq-platform-ui:0.1
+    depends_on:
+      dq-service:
+        condition: service_healthy
+    ports: ["8080"]
+    networks: [dq]
 
-  # Job Bronze -> Silver có DQ gate (Write-Audit-Publish), bản Python
-  spark-bronze-to-silver:
+  # Driver Spark chạy ad hoc: docker compose run --rm spark <spark-submit ...>
+  spark:
     <<: *spark-common
     profiles: [jobs]
-    command: >
-      /opt/spark/bin/spark-submit
-      --py-files /opt/dq/jobs/dq_client.py
-      --conf spark.dq.service.url=http://dq-service:8000
-      --conf spark.dq.dataset=silver.transactions
-      --conf spark.dq.mode=enforce
-      /opt/dq/jobs/bronze_to_silver.py --dt ${DT:-2026-10-17}
+    entrypoint: ["/opt/dq/bin/with-s3-env.sh"]
 
-  # Cùng job, bản Scala: cùng Bronze, cùng suite, ghi vào silver_scala/ và quarantine/transactions_scala/
-  spark-bronze-to-silver-scala:
-    <<: *spark-common
-    profiles: [jobs]
-    command: >
-      /opt/spark/bin/spark-submit
-      --class dqplatform.jobs.BronzeToSilverTransactions
-      --conf spark.dq.service.url=http://dq-service:8000
-      --conf spark.dq.dataset=silver.transactions
-      --conf spark.dq.mode=enforce
-      /opt/dq/jars/dq-platform.jar --dt ${DT:-2026-10-17}
+configs:
+  pg_init:
+    content: |
+      #!/bin/sh
+      set -eu
+      # được entrypoint postgres `source`: không exec, không đổi cwd của shell cha
+      (cd /dq-sql && psql -v ON_ERROR_STOP=1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -f init.sql)
 
-  # So kết quả job Python và job Scala với nhau và với baseline (chạy sau khi cả hai job đã chạy)
-  spark-parity-check:
-    <<: *spark-common
-    profiles: [jobs]
-    volumes:
-      - ./spark/jobs:/opt/dq/jobs:ro
-      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
-      - ./scripts:/opt/dq/scripts:ro
-      - lake:/data/lake
-    command: >
-      /opt/spark/bin/spark-submit /opt/dq/scripts/parity_check.py
-      --lake /data/lake --dt ${DT:-2026-10-17} --service-url http://dq-service:8000
+secrets:
+  postgres_password:
+    file: ${DQ_SECRETS_DIR:?DQ_SECRETS_DIR là bắt buộc}/postgres_password
+  minio_user:
+    file: ${DQ_SECRETS_DIR}/minio_user
+  minio_password:
+    file: ${DQ_SECRETS_DIR}/minio_password
+  database_url:
+    file: ${DQ_SECRETS_DIR}/database_url
+  token_registry.json:
+    file: ${DQ_SECRETS_DIR}/token_registry.json
+  job_token:
+    file: ${DQ_SECRETS_DIR}/job_token
 
 volumes:
   pgdata:
-  lake:
+  miniodata:
 
 networks:
   dq:

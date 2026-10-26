@@ -1,0 +1,33 @@
+# Base dùng chung mọi môi trường: control plane (dq-service + anomaly worker sidecar), migration hook,
+# RBAC Spark driver/executor, WorkflowTemplate chạy job Spark. Không chứa Secret: môi trường tạo
+# dq-database, dq-token-registry, dq-s3, dq-job-token (xem docs/engineering/k8s_argocd_architecture.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - runtime-configmap.yaml
+  - dq-service.yaml
+  - migrate-job.yaml
+  - spark-rbac.yaml
+  - spark-workflowtemplate.yaml
+  - cronworkflow-silver-transactions.yaml
+
+images:
+  - name: dq-platform/dq-service
+    newTag: "0.3.0"
+  - name: dq-platform/migrate
+    newTag: "0.3.0"
+
+# Một nguồn sự thật cho image Spark: driver (container workflow) và executor (DQ_SPARK_IMAGE) luôn cùng image
+replacements:
+  - source:
+      kind: ConfigMap
+      name: dq-runtime
+      fieldPath: data.spark_image
+    targets:
+      - select:
+          kind: WorkflowTemplate
+          name: dq-spark-job
+        fieldPaths:
+          - spec.templates.[name=spark-submit].container.image
+          - spec.templates.[name=spark-submit].container.env.[name=DQ_SPARK_IMAGE].value

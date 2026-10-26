@@ -1,0 +1,24 @@
+# Argo CD Application cho môi trường dev. repoURL/targetRevision là điểm khác nhau giữa môi trường.
+# Yêu cầu trước khi sync: Argo Workflows CRD đã cài; Secret runtime đã có trong namespace (deploy/k8s/bootstrap-secrets.py).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: dq-platform-dev
+  namespace: argocd-staging
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/TheFatGreyCat/dq-platform.git
+    targetRevision: main
+    path: deploy/k8s/overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dq-dev
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff: {duration: 10s, factor: 2, maxDuration: 3m}

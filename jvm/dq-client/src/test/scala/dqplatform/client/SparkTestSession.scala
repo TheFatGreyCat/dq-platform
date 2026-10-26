@@ -11,7 +11,9 @@ trait SparkTestSession extends BeforeAndAfterAll { self: TestSuite =>
     .appName(getClass.getSimpleName)
     .config("spark.ui.enabled", "false")
     .config("spark.sql.shuffle.partitions", "1")
-    .config("spark.sql.session.timeZone", "Asia/Ho_Chi_Minh")
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+    .config(RuntimeProfile.Conf.toSeq.foldLeft(new org.apache.spark.SparkConf()) { case (c, (k, v)) => c.set(k, v) })
     .getOrCreate()
 
   override def beforeAll(): Unit = {

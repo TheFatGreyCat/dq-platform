@@ -1,88 +1,97 @@
 # spark (image, cấu hình và job Python)
 
-Mọi thứ phía Spark (data plane): image chạy cả job Python lẫn Scala, cấu hình `spark.dq.*`, và các job Python mẫu.
+Phía Spark (data plane): image chạy cả job Python lẫn Scala, cấu hình `spark.dq.*` và runtime profile, job Python mẫu và bộ sinh Bronze.
 
 ```
 spark/
-├── Dockerfile                 # stage 1: mvn package ra dq-platform.jar; stage 2: apache/spark 3.5.1 + jar
-├── conf/spark-defaults.conf   # spark.jars + các tham số spark.dq.*
-└── jobs/
-    ├── dq_client.py           # wrapper py4j của dq-client (JVM)
-    ├── bronze_to_silver.py    # job Python: transform -> audit -> quarantine -> publish
-    └── generate_bronze.py     # sinh dữ liệu Bronze mẫu có lỗi cố ý
+├── Dockerfile                 # stage 1: mvn package (jar mỏng) + connector jars; stage 2: apache/spark 3.5.1
+├── conf/spark-defaults.conf   # jar DQ, Delta, runtime profile dq-runtime-v1, S3A, spark.dq.*
+├── with-s3-env.sh             # nạp credential S3A từ /run/secrets vào env của tiến trình Spark
+├── jobs/
+│   ├── dq_client.py           # cầu py4j mỏng trên dqplatform.client.PyBridge
+│   ├── bronze_to_silver.py    # job Python: transform -> start_write -> evaluate -> submit -> publish
+│   └── generate_bronze.py     # sinh Bronze mẫu (Delta, partition dt) có lỗi cố ý
+└── tests/test_jobs.py         # hành vi dữ liệu của job Python (chạy trong image Spark)
 ```
 
-Logic DQ **không** nằm ở đây. Nó nằm trong [jvm/dq-client](../jvm/dq-client/README.md); phía Python chỉ gọi vào. Job Scala tương đương ở [jvm/dq-jobs](../jvm/dq-jobs/README.md).
+Logic DQ **không** nằm ở đây: đo, phân loại dòng, ghi Delta nằm ở [jvm/dq-client](../jvm/dq-client/README.md); quyết định ở [dq-service](../dq-service/README.md). Phía Python chỉ chuyển JSON và DataFrame, không tự tính rule/policy và không ghi Delta bảng đích. Job Scala tương đương ở [jvm/dq-jobs](../jvm/dq-jobs/README.md).
 
 ## Dockerfile
 
-Build context phải là **thư mục gốc repo** (không phải `spark/`), vì stage 1 cần `jvm/` và `suites/` (test đọc suite thật):
+Build context phải là **thư mục gốc repo**; bắt buộc truyền `HADOOP_VERSION` (phải đúng Hadoop của image Spark; không có mặc định):
 
 ```bash
-docker build -f spark/Dockerfile -t dq-demo/spark-deequ:3.5.1 .
+docker build -f spark/Dockerfile --build-arg HADOOP_VERSION=<version> -t dq-demo/spark-deequ:3.5.1 .
 ```
 
 | Stage | Làm gì |
 |---|---|
-| `build` (`maven:3.9-eclipse-temurin-17`) | `mvn package` (gồm test) ra `dq-platform.jar` |
-| cuối (`apache/spark:3.5.1-scala2.12-java17-python3-ubuntu`) | Chép jar vào `/opt/dq/jars/` |
+| `build` (Maven, JDK 17, pin digest) | `mvn package` ra `dq-client`, `dq-jobs` và jar phụ thuộc rời (Deequ...); tải `hadoop-aws` đúng `HADOOP_VERSION`, `aws-java-sdk-bundle` theo POM của nó, và `delta-spark`/`delta-storage` 3.2.0 |
+| cuối (`apache/spark:3.5.1-scala2.12-java17-python3-ubuntu`, pin digest) | Delta/S3A vào `/opt/spark/jars`; jar DQ và Deequ vào `/opt/dq/jars`; `spark-defaults.conf`, `k8s_submit.py`, `run_dataset_job.py` vào image; `WORKDIR /opt/dq/work` (user `spark` ghi được, executor k8s chép file vào đây) |
 
-Không cần `pip install` gì: Deequ chạy trong JVM, executor không cần package Python nào. Driver và executor dùng chung image.
+Không còn jar shade: mỗi jar giữ nguyên để hash từng jar trong compat manifest có nghĩa. Không cần `pip install` thêm: Deequ chạy trong JVM, executor không cần package Python.
+
+Trên k8s, entrypoint driver là `/opt/dq/bin/k8s_submit.py` (env do WorkflowTemplate `dq-spark-job` đặt): dựng `spark-submit` client mode với `spark.master=k8s://...`, jar `local://` từ image, executor gắn label `dq-run-key`, credential S3 qua `secretKeyRef`; job có DQ gate được bọc bởi `run_dataset_job.py --k8s-executor-wait`.
 
 ## spark-defaults.conf
 
 | Config | Ý nghĩa |
 |---|---|
-| `spark.jars` | `/opt/dq/jars/dq-platform.jar`: client DQ cho job Python. Thiếu thì `DQClient(spark)` báo lỗi "không tìm thấy dqplatform.client.DQClient" |
-| `spark.dq.service.url` | Địa chỉ DQ service |
-| `spark.dq.mode` | `enforce` hoặc `monitor` |
-| `spark.dq.fail.on.service.error` | Fail-closed (`true`) hay fail-open (`false`) |
-| `spark.dq.service.timeout.sec` | Timeout HTTP |
-| `spark.dq.quarantine.path`, `spark.dq.staging.path` | Nơi ghi dòng lỗi và vùng staging của WAP |
+| `spark.jars` | `dq-client`, `dq-jobs`, Deequ. Thiếu thì Python báo không tìm thấy `PyBridge` |
+| `spark.sql.extensions`, `spark.sql.catalog.spark_catalog` | Delta |
+| 5 conf runtime profile `dq-runtime-v1` | `spark.sql.session.timeZone=UTC`, `spark.sql.ansi.enabled=false`, `spark.sql.caseSensitive=false`, `spark.sql.legacy.timeParserPolicy=EXCEPTION`, `spark.sql.sources.partitionOverwriteMode=static`. Server ghim đúng 5 khoá này trong plan; SDK kiểm lại, lệch thì dừng (`RUNTIME_MISMATCH`) trước khi đọc dữ liệu |
+| `spark.hadoop.fs.s3a.*` | MinIO/S3A path-style; credential qua env `AWS_*` do `with-s3-env.sh` đặt từ file secret, không nằm trong conf, CLI hay log |
+| `spark.dq.service.url`, `spark.dq.service.timeout.sec`, `spark.dq.purpose` | Địa chỉ service, timeout HTTP (mặc định 10), purpose (mặc định `default`) |
 
-`spark.dq.dataset` do từng job đặt qua `--conf`. Token: biến môi trường `DQ_API_TOKEN` của driver.
-
-Bảng đầy đủ về từng config và ý nghĩa fail-open / fail-closed ở [README gốc](../README.md#cấu-hình-job-spark).
+`spark.dq.dataset`, `spark.dq.compat.manifest.id`, `spark.dq.state.dir` do launcher/harness đặt theo từng lần chạy. Token: env `DQ_API_TOKEN` của driver; `DQ_RUN_KEY` bắt buộc (launcher đặt). Bảng đầy đủ các key ở [dq-client](../jvm/dq-client/README.md#cấu-hình).
 
 ## Job Python
 
 ### `dq_client.py`
 
-Giữ nguyên API cũ để job không phải đổi:
-
 ```python
 dq = DQClient(spark)
-res = dq.validate(df, partition_spec="dt=2026-10-17", suite_parameters={...})
-res.verdict, res.reasons, res.valid_df, res.quarantine_df, res.should_publish
-res.release()     # gỡ cache; gọi sau khi ghi xong valid_df / quarantine_df
+handle     = dq.start_write({"dt": "2026-10-17"}, parameters, "2026-10-17T00:00:00Z")
+evaluation = dq.evaluate(handle, df)
+accepted   = dq.submit(evaluation)       # accepted["decision"]["decision"] là ALLOW hoặc DENY
+publication = dq.publish(evaluation, accepted)   # chỉ khi ALLOW; {silver:{state,...}, quarantine:{...}}
 ```
 
-`DQFailed` được ném khi DQ service lỗi ở chế độ fail-closed (hoặc bị từ chối bằng 4xx). `quarantine_df` có cột `_dq_errors`: danh sách id rule bị vi phạm.
+Handle/evaluation/accepted là dict JSON. `DQFailed` mang `code` ổn định của JVM (exception gốc không bao giờ được chuyển sang Python). Không có `DQResult`, `verdict`, `valid_df` hay cờ publish.
 
 ### `bronze_to_silver.py`
 
-Cùng luồng với job Scala; ghi vào `silver/transactions` và `quarantine/transactions`. Quarantine và publish gọi `dqplatform.jobs.Wap` trong jar qua py4j, nên hai job dùng đúng một code ghi. Exit code: `0` đã publish, `2` DQ service lỗi, `3` verdict FAIL.
+Luồng giống job Scala: kiểm runtime profile → đọc Bronze Delta ở version cố định, lọc `dt` → tính tham số (kể cả `source_row_count` độc lập với transform) → transform (`dt` là `DateType`) → `start_write` → `evaluate` → `submit` → nếu `ALLOW` thì `publish` (JVM ghi quarantine rồi Silver).
 
-Transform phải khớp với [TransactionsTransform.scala](../jvm/dq-jobs/src/main/scala/dqplatform/jobs/TransactionsTransform.scala): sửa một bên thì sửa cả hai, rồi chạy [scripts/parity_check.py](../scripts/parity_check.py).
+```bash
+spark-submit --py-files jobs/dq_client.py jobs/bronze_to_silver.py --dt 2026-10-17 --lake /data/lake
+```
+
+Chỉ có `--dt` và `--lake` (Bronze dev). Bảng đích do registration của dataset (`spark.dq.dataset`) quyết định. Exit code: `0` đã commit cả hai (quarantine không áp dụng cũng tính), `3` `DENY`, `2` lỗi kỹ thuật/service/cấu hình/ghi chưa xác định. Dòng cuối stdout là JSON `{execution_id, decision, publication}`. Nên chạy qua [scripts/run_dataset_job.py](../scripts/run_dataset_job.py).
+
+Transform phải khớp [TransactionsTransform.scala](../jvm/dq-jobs/src/main/scala/dqplatform/jobs/TransactionsTransform.scala): sửa một bên thì sửa cả hai, rồi so hai execution bằng [scripts/parity_check.py](../scripts/parity_check.py) (`--python-execution E1 --scala-execution E2 --service-url URL --output result.json`, token ở env `DQ_API_TOKEN`): so report đã lưu (rule, số đo, schema evidence, số đếm, lỗi, decision) và với `--spark --dt` so từng dòng của output đã publish bằng `exceptAll` hai chiều.
 
 ### `generate_bronze.py`
 
-Sinh Bronze có replay (50 dòng gửi lại) và lỗi cố ý mỗi loại ứng với một dimension: thiếu `subscriber_id` và `amount` không ép được (completeness), msisdn / amount âm / status sai (validity), `event_time` sai ngày (consistency).
+Sinh Bronze **Delta** (`partitionBy dt`, `dt` kiểu date) với 50 dòng replay và lỗi cố ý mỗi loại ứng với một dimension. Ngày đã có thì thay đúng partition bằng `replaceWhere` (giữ ngày khác); lần đầu tạo bảng.
 
 ```bash
 spark-submit generate_bronze.py --out /data/lake/bronze/transactions --dt 2026-10-17 --rows 10000 --bad-ratio 0.03
 ```
 
-`--bad-ratio 0.12` để thử kịch bản FAIL (quarantine vượt 5%, job exit 3). `--seed` mặc định 42, và số liệu baseline trong tài liệu dựa trên seed này.
+`--bad-ratio` thử kịch bản `DENY` khi tỉ lệ quarantine vượt `max_quarantine_ratio` của policy. `--seed` mặc định 42.
 
-## Chạy job Python không dùng Docker
+## Chạy
+
+Dùng stack cô lập ([README gốc](../README.md#stack-cô-lập-và-nghiệm-thu)); driver Spark là service `spark` (profile `jobs`):
 
 ```bash
-export DQ_API_TOKEN=<token>
-spark-submit --master "local[2]" \
-  --jars ../jvm/dq-jobs/target/dq-platform.jar --py-files jobs/dq_client.py \
-  --conf spark.dq.service.url=http://127.0.0.1:8000 --conf spark.dq.dataset=silver.transactions \
-  jobs/bronze_to_silver.py --dt 2026-10-17 --lake /tmp/lake
+DQ_SECRETS_DIR=/abs/secrets MINIO_IMAGE=<image@sha256:...> HADOOP_VERSION=<version> \
+  docker compose -p <project> run --rm spark <spark-submit ...>
 ```
 
-Cần build jar trước (`mvn -f ../jvm/pom.xml package`) và có DQ service đang chạy.
+Dataset, grant, suite, purpose và manifest phải được tạo và accept trước (README gốc, "Thứ tự khởi tạo").
+
+## Test
+
+`spark/tests/test_jobs.py` kiểm hành vi dữ liệu (Bronze Delta, transform, tham số suite) và phải chạy trong image Spark; lệnh nằm ở docstring đầu file. Test của service và JVM: `python -m pytest dq-service/tests`, `mvn -f jvm/pom.xml -B test`; của launcher: `python -m pytest scripts/tests`.

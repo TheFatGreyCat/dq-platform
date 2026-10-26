@@ -49,3 +49,6 @@ CREATE TABLE IF NOT EXISTS dq_rule_results (
 );
 CREATE INDEX IF NOT EXISTS idx_dq_rule_dim ON dq_rule_results (dataset, dimension, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dq_rule_id  ON dq_rule_results (dataset, rule_id, created_at DESC);
+
+-- Schema v2 (execution/registry bất biến), cạnh các bảng legacy ở trên; không đụng dữ liệu legacy.
+\ir migrations/002_execution_v2.sql

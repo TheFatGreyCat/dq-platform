@@ -1,0 +1,24 @@
+# Bronze -> Silver transactions hằng đêm cho ngày hôm trước (UTC), qua DQ gate WRITE_GATE/default.
+# compat-manifest-id: id manifest đã được approver accept cho dataset (overlay đặt sau khi chạy CompatibilityProbe).
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: silver-transactions-nightly
+spec:
+  schedules: ["30 1 * * *"]
+  timezone: UTC
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 14
+  workflowSpec:
+    workflowTemplateRef: {name: dq-spark-job}
+    arguments:
+      parameters:
+        - {name: dataset, value: silver.transactions}
+        - {name: purpose, value: default}
+        - {name: compat-manifest-id, value: SET_IN_OVERLAY}
+        - {name: mutex, value: dq-silver.transactions}
+        - {name: job-class, value: dqplatform.jobs.BronzeToSilverTransactions}
+        - name: job-args
+          value: '["--dt", "{{=sprig.date(''2006-01-02'', sprig.dateModify(''-24h'', sprig.now()))}}", "--lake", "s3a://dq-lake"]'

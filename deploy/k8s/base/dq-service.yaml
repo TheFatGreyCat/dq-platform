@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dq-service
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dq-service
+  labels: {app.kubernetes.io/name: dq-service, app.kubernetes.io/part-of: dq-platform}
+spec:
+  # Stateless: idempotency, khóa và state machine nằm trong transaction Postgres
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: dq-service}
+  strategy:
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: dq-service, app.kubernetes.io/part-of: dq-platform}
+    spec:
+      serviceAccountName: dq-service
+      automountServiceAccountToken: false
+      containers:
+        - name: api
+          image: dq-platform/dq-service
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "app:app_from_env", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+          env:
+            - {name: DATABASE_URL_FILE, value: /run/secrets/dq/database/database_url}
+            - {name: DQ_TOKEN_REGISTRY_FILE, value: /run/secrets/dq/registry/token_registry.json}
+            # worker là container cùng pod, chỉ nghe loopback
+            - {name: DQ_ANOMALY_WORKER_URL, value: "http://127.0.0.1:8081"}
+            - {name: DQ_RESTORE_MODE, value: "0"}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          securityContext: &sc
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: database, mountPath: /run/secrets/dq/database, readOnly: true}
+            - {name: registry, mountPath: /run/secrets/dq/registry, readOnly: true}
+        - name: anomaly-worker
+          image: dq-platform/dq-service
+          imagePullPolicy: IfNotPresent
+          command: ["java", "-Xmx256m", "-cp", "/opt/dq-worker/dq-anomaly-worker-0.1.0.jar:/opt/dq-worker/lib/*",
+                    "dqplatform.worker.AnomalyWorker", "--port", "8081"]
+          # worker chỉ bind loopback; kubelet probe đi qua pod IP nên probe bằng exec trong container
+          readinessProbe:
+            exec: {command: ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=2)"]}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 50m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          securityContext: *sc
+      volumes:
+        # 0400: auth.TokenRegistry.from_file từ chối file group/other đọc được
+        - name: database
+          secret: {secretName: dq-database, defaultMode: 0400, items: [{key: database_url, path: database_url}]}
+        - name: registry
+          secret: {secretName: dq-token-registry, defaultMode: 0400}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dq-service
+  labels: {app.kubernetes.io/name: dq-service}
+spec:
+  selector: {app.kubernetes.io/name: dq-service}
+  ports: [{name: http, port: 8000, targetPort: http}]

@@ -1,0 +1,25 @@
+# Môi trường dev/test cô lập: Postgres + MinIO chạy trong cluster, image build local (không registry).
+# Secret KHÔNG nằm trong Git: chạy bootstrap-secrets.sh một lần cho namespace trước khi Argo CD sync.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dq-dev
+
+resources:
+  - namespace.yaml
+  - ../../base
+  - postgres.yaml
+  - minio.yaml
+
+patches:
+  # dev: một replica, dữ liệu synthetic
+  - target: {kind: Deployment, name: dq-service}
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  # dev không chạy lịch nightly tự động; kích hoạt thủ công bằng `argo submit --from cronwf/...`
+  - target: {kind: CronWorkflow, name: silver-transactions-nightly}
+    patch: |-
+      - op: add
+        path: /spec/suspend
+        value: true

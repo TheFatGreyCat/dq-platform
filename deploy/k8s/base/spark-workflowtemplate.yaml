@@ -1,0 +1,84 @@
+# Một job Spark = một Workflow. Bước `spark-submit` là pod driver (client mode); executor là pod k8s gắn label
+# dq-run-key và ownerReference về driver. Job có DQ gate (dataset != "") chạy qua run_dataset_job.py: launcher chờ
+# executor biến mất rồi mới gửi stop-confirmation `k8s-pod:<ns>/<pod>:<run-key>:exit=<code>`.
+#
+# Loại trừ cross-pod cho cùng cặp bảng đích: synchronization mutex theo dataset (flock của launcher chỉ cục bộ pod)
+# + service từ chối start khi dataset còn execution REPORTED/unresolved hoặc attempt chưa xác nhận dừng.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: dq-spark-job
+spec:
+  entrypoint: spark-submit
+  serviceAccountName: dq-spark
+  arguments:
+    parameters:
+      - name: dataset            # "" = job không qua DQ gate (probe/bootstrap)
+        value: ""
+      - name: purpose
+        value: default
+      - name: compat-manifest-id
+        value: ""
+      - name: job-class
+      - name: job-args           # JSON array string
+        value: "[]"
+      - name: mutex
+        value: "dq-ungated"
+  synchronization:
+    mutexes:
+      - name: "{{workflow.parameters.mutex}}"
+  # Không retry tự động: attempt UNKNOWN/FAILED chỉ được mở lại qua quy trình operator (xem docs)
+  templates:
+    - name: spark-submit
+      retryStrategy: {limit: "0"}
+      activeDeadlineSeconds: 21600
+      podSpecPatch: '{"terminationGracePeriodSeconds": 330}'
+      metadata:
+        labels: {app.kubernetes.io/name: dq-spark-driver, app.kubernetes.io/part-of: dq-platform}
+      container:
+        image: SPARK_IMAGE_FROM_CONFIGMAP
+        imagePullPolicy: IfNotPresent
+        command: ["/opt/dq/bin/k8s_submit.py"]
+        env:
+          - name: POD_NAME
+            valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          - name: POD_NAMESPACE
+            valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          - name: POD_IP
+            valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          # ổn định trong một Workflow; là label value hợp lệ
+          - {name: DQ_RUN_KEY, value: "{{workflow.name}}"}
+          - {name: DQ_SPARK_IMAGE, value: SPARK_IMAGE_FROM_CONFIGMAP}
+          - {name: DQ_S3_SECRET, value: dq-s3}
+          - {name: DQ_GATED_DATASET, value: "{{workflow.parameters.dataset}}"}
+          - {name: DQ_PURPOSE, value: "{{workflow.parameters.purpose}}"}
+          - {name: DQ_COMPAT_MANIFEST_ID, value: "{{workflow.parameters.compat-manifest-id}}"}
+          - {name: DQ_JOB_CLASS, value: "{{workflow.parameters.job-class}}"}
+          - {name: DQ_JOB_ARGS, value: "{{workflow.parameters.job-args}}"}
+          - name: DQ_S3_ENDPOINT
+            valueFrom: {configMapKeyRef: {name: dq-runtime, key: s3_endpoint}}
+          - name: DQ_STATE_DIR
+            valueFrom: {configMapKeyRef: {name: dq-runtime, key: state_dir}}
+          - name: DQ_SERVICE_URL
+            valueFrom: {configMapKeyRef: {name: dq-runtime, key: service_url}}
+          - name: DQ_EXECUTOR_INSTANCES
+            valueFrom: {configMapKeyRef: {name: dq-runtime, key: executor_instances}}
+          - name: DQ_EXECUTOR_MEMORY
+            valueFrom: {configMapKeyRef: {name: dq-runtime, key: executor_memory}}
+          - name: DQ_EXECUTOR_CORES
+            valueFrom: {configMapKeyRef: {name: dq-runtime, key: executor_cores}}
+          - name: DQ_EXECUTOR_WAIT_SEC
+            valueFrom: {configMapKeyRef: {name: dq-runtime, key: executor_wait_sec}}
+          # credential chỉ qua env của tiến trình, không qua Spark conf/argv/UI
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom: {secretKeyRef: {name: dq-s3, key: access-key}}
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom: {secretKeyRef: {name: dq-s3, key: secret-key}}
+          - name: DQ_API_TOKEN
+            valueFrom: {secretKeyRef: {name: dq-job-token, key: token, optional: true}}
+        resources:
+          requests: {cpu: 500m, memory: 1Gi}
+          limits: {memory: 2Gi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: [ALL]}

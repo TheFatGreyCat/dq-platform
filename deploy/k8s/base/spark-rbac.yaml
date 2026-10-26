@@ -1,0 +1,29 @@
+# dq-spark: SA của pod driver (bước workflow). Spark client mode tạo/xóa executor pod; launcher list pod
+# theo label dq-run-key để xác nhận executor đã dừng. Argo executor cần workflowtaskresults.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dq-spark
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dq-spark
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, watch, delete, deletecollection, patch]
+  - apiGroups: [""]
+    resources: [services, configmaps, persistentvolumeclaims]
+    verbs: [create, get, list, watch, delete, deletecollection]
+  - apiGroups: [argoproj.io]
+    resources: [workflowtaskresults]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dq-spark
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: dq-spark}
+subjects:
+  - {kind: ServiceAccount, name: dq-spark}

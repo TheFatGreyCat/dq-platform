@@ -12,7 +12,7 @@
 
   <artifactId>dq-jobs</artifactId>
   <name>DQ Spark jobs (Scala)</name>
-  <description>Job Spark Scala + đóng gói jar duy nhất dq-platform.jar (client + Deequ) cho mọi job</description>
+  <description>Job Spark Scala: thin jar; dq-client + Deequ copy riêng vào target/lib</description>
 
   <dependencies>
     <dependency>
@@ -31,6 +31,11 @@
     <dependency>
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-mllib_${scala.binary.version}</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.delta</groupId>
+      <artifactId>delta-spark_${scala.binary.version}</artifactId>
+      <scope>provided</scope>
     </dependency>
     <dependency>
       <groupId>org.scalatest</groupId>
@@ -56,27 +61,18 @@
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-shade-plugin</artifactId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.6.1</version>
         <executions>
           <execution>
+            <id>copy-dq-libs</id>
             <phase>package</phase>
-            <goals><goal>shade</goal></goals>
+            <goals><goal>copy-dependencies</goal></goals>
             <configuration>
-              <!-- jvm/dq-jobs/target/dq-platform.jar: chỉ chứa dependency scope compile
-                   (dq-client, deequ); Spark/Scala/Jackson là provided -->
-              <finalName>dq-platform</finalName>
-              <createDependencyReducedPom>false</createDependencyReducedPom>
-              <filters>
-                <filter>
-                  <artifact>*:*</artifact>
-                  <excludes>
-                    <exclude>META-INF/*.SF</exclude>
-                    <exclude>META-INF/*.DSA</exclude>
-                    <exclude>META-INF/*.RSA</exclude>
-                    <exclude>META-INF/MANIFEST.MF</exclude>
-                  </excludes>
-                </filter>
-              </filters>
+              <outputDirectory>${project.build.directory}/lib</outputDirectory>
+              <includeScope>runtime</includeScope>
+              <!-- chỉ Deequ + dq-client; Spark/Scala/Hadoop/Jackson/Delta do Spark image cung cấp -->
+              <includeGroupIds>com.amazon.deequ,dqplatform</includeGroupIds>
             </configuration>
           </execution>
         </executions>

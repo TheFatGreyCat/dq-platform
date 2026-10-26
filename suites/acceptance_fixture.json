@@ -1,0 +1,132 @@
+{
+  "dataset": "acceptance.fixture",
+  "workflow": "WRITE_GATE",
+  "purpose": "default",
+  "suite": {
+    "format": "dq-rules/v3",
+    "workflow": "WRITE_GATE",
+    "description": "Fixture V1 xác định: 100 dòng, 3 dòng vi phạm (synthetic)",
+    "parameters": {
+      "partition_start": "đầu ngày dt (yyyy-MM-dd 00:00:00)",
+      "partition_end": "đầu ngày dt+1"
+    },
+    "rules": [
+      {
+        "rule_id": "raw_rows",
+        "dimension": "completeness",
+        "scope": "PARTITION",
+        "stage": "RAW",
+        "description": "số dòng candidate thô (chuỗi lịch sử anomaly)",
+        "check": {
+          "kind": "size",
+          "assert": {
+            "op": ">=",
+            "value": 0
+          }
+        }
+      },
+      {
+        "rule_id": "candidate_rows",
+        "dimension": "completeness",
+        "scope": "PARTITION",
+        "stage": "CANDIDATE",
+        "description": "candidate không rỗng",
+        "check": {
+          "kind": "size",
+          "assert": {
+            "op": ">=",
+            "value": 1
+          }
+        }
+      },
+      {
+        "rule_id": "value_complete",
+        "dimension": "completeness",
+        "scope": "PARTITION",
+        "stage": "CANDIDATE",
+        "check": {
+          "kind": "complete",
+          "column": "value"
+        }
+      },
+      {
+        "rule_id": "amount_range",
+        "dimension": "validity",
+        "scope": "PARTITION",
+        "stage": "CANDIDATE",
+        "check": {
+          "kind": "range",
+          "column": "amount",
+          "min": 0,
+          "max": 100
+        }
+      },
+      {
+        "rule_id": "event_time_in_partition",
+        "dimension": "consistency",
+        "scope": "PARTITION",
+        "stage": "CANDIDATE",
+        "check": {
+          "kind": "sql_predicate",
+          "columns": [
+            "event_time"
+          ],
+          "predicate": "event_time IS NULL OR (event_time >= TIMESTAMP '${partition_start}' AND event_time < TIMESTAMP '${partition_end}')"
+        }
+      },
+      {
+        "rule_id": "clean_row_count_min",
+        "dimension": "completeness",
+        "scope": "PARTITION",
+        "stage": "CLEAN",
+        "check": {
+          "kind": "size",
+          "assert": {
+            "op": ">=",
+            "value": 1
+          }
+        }
+      }
+    ]
+  },
+  "policy": {
+    "rules": [
+      {
+        "rule_id": "amount_range",
+        "action": "QUARANTINE",
+        "required": true
+      },
+      {
+        "rule_id": "candidate_rows",
+        "action": "BLOCK",
+        "required": true
+      },
+      {
+        "rule_id": "clean_row_count_min",
+        "action": "BLOCK",
+        "required": true
+      },
+      {
+        "rule_id": "event_time_in_partition",
+        "action": "QUARANTINE",
+        "required": true
+      },
+      {
+        "rule_id": "raw_rows",
+        "action": "OBSERVE",
+        "required": false
+      },
+      {
+        "rule_id": "value_complete",
+        "action": "QUARANTINE",
+        "required": true
+      }
+    ],
+    "min_candidate_rows": 1,
+    "min_clean_rows": 1,
+    "max_quarantine_ratio": "0.05",
+    "anomaly": {
+      "enabled": false
+    }
+  }
+}

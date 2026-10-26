@@ -1,0 +1,100 @@
+{
+ "canonical_vectors": [
+  {
+   "name": "sorted_keys",
+   "json": "{\"b\":1,\"a\":[true,null,\"é\"]}",
+   "canonical": "{\"a\":[true,null,\"é\"],\"b\":1}",
+   "hash": "sha256:17c8c6f7f948ee1c9b93b1bc35f6edc29cbaf3022bff7d076d1c4831dd8a44a2"
+  },
+  {
+   "name": "decimals",
+   "json": "{\"x\":1.50,\"y\":-0.0,\"z\":10,\"w\":1E+2,\"v\":0.000}",
+   "canonical": "{\"v\":0,\"w\":100,\"x\":1.5,\"y\":0,\"z\":10}",
+   "hash": "sha256:b0c857fc354b0819d66539098613dfc0d104e93dcf09b6afb6d61a136e36f804"
+  },
+  {
+   "name": "unicode_order",
+   "json": "{\"\\ud83d\\ude00\":1,\"￿\":2,\"a\":3}",
+   "canonical": "{\"a\":3,\"￿\":2,\"😀\":1}",
+   "hash": "sha256:48f8c136ce1b1fb6cc384c2a496fcab8d870f137c9ef71a97d7c4475f6d0eb5d"
+  },
+  {
+   "name": "nested",
+   "json": "{\"rules\":[{\"rule_id\":\"r1\",\"p\":{\"k\":2.10}}]}",
+   "canonical": "{\"rules\":[{\"p\":{\"k\":2.1},\"rule_id\":\"r1\"}]}",
+   "hash": "sha256:f990f82064c9a58820c9ed55ea994327b6d9f4c5302e16dc10eecd57a69f02e0"
+  },
+  {
+   "name": "escapes",
+   "json": "{\"k\\u0001\\\"\\\\\\n\\ud83d\\ude00\":\"v\\t\\u001f\\u007f\\ud83d\\ude00\",\"a\":1}",
+   "canonical": "{\"a\":1,\"k\\u0001\\\"\\\\\\n😀\":\"v\\t\\u001f😀\"}",
+   "hash": "sha256:0aa3885195ae303b09dabba8d895fe9980b5fe399ea8a7569b2b5817cac8b3b6"
+  }
+ ],
+ "hash_vectors": [
+  {
+   "name": "metric_complete",
+   "check": {
+    "kind": "complete",
+    "column": "value"
+   },
+   "metric_hash": "sha256:2612cd54de3a575ab5dad45b747957fdd8fc03051ac6d6accd6412158b2e0726"
+  },
+  {
+   "name": "metric_range_assert_ignored",
+   "check": {
+    "kind": "range",
+    "column": "amount",
+    "min": "0",
+    "max": "100",
+    "assert": {
+     "op": ">=",
+     "value": "1"
+    }
+   },
+   "metric_hash": "sha256:e672cb92eaa398573e244f31d51379cec4f7a093aa313e424f077dcfd18e84fa"
+  }
+ ],
+ "semantics_version": "dq-semantics-v3-1:dq-runtime-v1",
+ "decimals": {
+  "1.50": "1.5",
+  "-0.0": "0",
+  "1E+2": "100",
+  "0.000": "0",
+  "1000": "1000"
+ },
+ "rejected_json": [
+  "{\"a\":1,\"a\":2}",
+  "{\"a\":{\"b\":1,\"b\":2}}",
+  "NaN",
+  "{\"a\":Infinity}",
+  "-Infinity"
+ ],
+ "schema_vectors": [
+  {
+   "name": "ordered_struct",
+   "fields": [
+    {
+     "name": "id",
+     "type": "long",
+     "nullable": false,
+     "metadata": {}
+    },
+    {
+     "name": "amount",
+     "type": "decimal(18,2)",
+     "nullable": true,
+     "metadata": {
+      "comment": "x"
+     }
+    },
+    {
+     "name": "dt",
+     "type": "date",
+     "nullable": true
+    }
+   ],
+   "schema_hash": "sha256:9e9750e1173fd064f7f58e726790baea89ce4e77d6f156708b48c3e87278735b"
+  }
+ ]
+}

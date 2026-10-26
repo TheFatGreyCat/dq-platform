@@ -19,7 +19,7 @@ object TransactionsTransform {
       // để rule completeness đưa vào quarantine thay vì mất im lặng.
       .where(col("_rn") === 1 || col("transaction_id").isNull)
       .drop("_rn", "ingest_time")
-      .withColumn("dt", lit(dt))
+      .withColumn("dt", to_date(lit(dt)))
   }
 
   /** Số giao dịch nguồn, tính thẳng từ Bronze, độc lập với transform -> rule đối soát completeness. */

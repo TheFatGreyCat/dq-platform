@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dq-runtime
+data:
+  # Overlay PHẢI đặt image theo digest (@sha256:...) ở production: compat manifest đã accept gắn với đúng jar
+  spark_image: dq-platform/spark:0.3.0
+  s3_endpoint: http://minio:9000
+  # state dir của DQ client (handle/report từng attempt) phải sống lâu hơn pod driver -> object store
+  state_dir: s3a://dq-lake/_dq_state
+  service_url: http://dq-service:8000
+  executor_instances: "2"
+  executor_memory: 1g
+  executor_cores: "1"
+  # chờ executor pod (label dq-run-key) biến mất trước khi xác nhận writer đã dừng
+  executor_wait_sec: "300"

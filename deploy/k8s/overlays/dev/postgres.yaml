@@ -1,0 +1,53 @@
+# Postgres dev trong cluster (production: managed Postgres, chỉ Secret dq-database trỏ tới đó).
+# sync-wave -2: sẵn sàng trước hook migration (-1).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  annotations: {argocd.argoproj.io/sync-wave: "-2"}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: postgres}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: postgres, app.kubernetes.io/part-of: dq-platform}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+          env:
+            - {name: POSTGRES_DB, value: dq}
+            - {name: POSTGRES_USER, value: dq}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: dq-database, key: postgres_password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{name: pg, containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "dq", "-d", "dq"]}
+            periodSeconds: 3
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: postgres-data}
+---
+# PVC riêng thay volumeClaimTemplates: Argo CD (server-side diff) không bị lệch vì status.phase của template
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  annotations: {argocd.argoproj.io/sync-wave: "-2"}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 2Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  annotations: {argocd.argoproj.io/sync-wave: "-2"}
+spec:
+  selector: {app.kubernetes.io/name: postgres}
+  ports: [{name: pg, port: 5432, targetPort: pg}]
