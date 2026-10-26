@@ -29,6 +29,10 @@ def row(tid, ingest, **kw):
     return r
 
 
+def frame(spark, rows):
+    return spark.createDataFrame([tuple(r[f.name] for f in gen.SCHEMA.fields) for r in rows], gen.SCHEMA)
+
+
 class JobsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -50,7 +54,7 @@ class JobsTest(unittest.TestCase):
 
     def test_1_bronze_days_isolated_and_transform(self):
         s = self.spark
-        gen.write_day(s, self.root, OTHER, [row("A1", "2026-10-20 01:00:00", event_time=f"{OTHER} 09:00:00")])
+        gen.write_day(s, self.root, OTHER, frame(s, [row("A1", "2026-10-20 01:00:00", event_time=f"{OTHER} 09:00:00")]))
         rows = [
             row("T1", "2026-10-21 00:10:00", amount="10000"),
             row("T1", "2026-10-21 02:00:00", amount="20000"),  # replay mới hơn: thắng
@@ -58,8 +62,8 @@ class JobsTest(unittest.TestCase):
             row(None, "2026-10-21 00:10:00"),                  # null key: giữ cả hai
             row("T2", "2026-10-21 00:10:00", amount="50k"),    # cast hỏng -> null, vẫn giữ dòng
         ]
-        gen.write_day(s, self.root, DT, rows)
-        gen.write_day(s, self.root, DT, rows)                  # replaceWhere: chạy lại không nhân bản, không đụng ngày khác
+        gen.write_day(s, self.root, DT, frame(s, rows))
+        gen.write_day(s, self.root, DT, frame(s, rows))  # replaceWhere: chạy lại không nhân bản, không đụng ngày khác
 
         self.assertEqual(s.read.format("delta").load(self.root).where(f"dt = DATE '{OTHER}'").count(), 1)
         raw, version = b2s.pinned_bronze(s, self.root, DT)
@@ -86,14 +90,25 @@ class JobsTest(unittest.TestCase):
     def test_2_generated_bronze_replay_and_pin(self):
         s = self.spark
         root = f"{self.tmp.name}/gen"
-        rows = gen.generate(DT, 10, 0.0, 7)
-        self.assertEqual(len(rows), 10 + 10)  # replay = range(min(rows,50))
+        rows = gen.generate(s, DT, 10, 0.0, 7, partitions=3)
+        self.assertEqual(rows.count(), 10 + 10)  # replay = range(min(rows,50))
         gen.write_day(s, root, DT, rows)
         raw, v0 = b2s.pinned_bronze(s, root, DT)
-        gen.write_day(s, root, OTHER, gen.generate(OTHER, 3, 0.0, 7))  # version mới sau khi pin
+        gen.write_day(s, root, OTHER, gen.generate(s, OTHER, 3, 0.0, 7))  # version mới sau khi pin
         self.assertEqual(raw.count(), 20)                               # pin không đổi
         self.assertEqual(b2s.transform(raw, DT).count(), 10)            # dedup replay
         self.assertEqual(b2s.source_row_count(raw), 10)
+
+    def test_2b_generator_deterministic_and_bad_ratio(self):
+        s = self.spark
+        a = gen.generate(s, DT, 20000, 0.1, 42, partitions=1).collect()
+        b = gen.generate(s, DT, 20000, 0.1, 42, partitions=4).collect()
+        self.assertEqual(sorted(map(tuple, a)), sorted(map(tuple, b)))  # không phụ thuộc số partition
+        df = gen.generate(s, DT, 20000, 0.1, 42)
+        bad = df.where("subscriber_id IS NULL OR amount IN ('50k', '-50000') OR msisdn = '12345' "
+                       f"OR status = 'PENDING???' OR event_time < '{DT} 00:00:00'").count()
+        self.assertTrue(0.08 < bad / 20050 < 0.12, bad)
+        self.assertEqual(df.where("ingest_time LIKE '2026-10-21 02:00:00'").count(), 50)  # 50 replay rows
 
     def test_3_suite_parameters(self):
         self.assertEqual(b2s.suite_parameters(DT, 7), {
