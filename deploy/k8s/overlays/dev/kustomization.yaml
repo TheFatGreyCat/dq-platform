@@ -5,7 +5,6 @@ kind: Kustomization
 namespace: dq-dev
 
 resources:
-  - namespace.yaml
   - ../../base
   - postgres.yaml
   - minio.yaml
