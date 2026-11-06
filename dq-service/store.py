@@ -22,7 +22,7 @@ from canonical import canonical_timestamp, content_hash
 from errors import ApiError
 from models import CompatManifest, Policy, Registration, Suite, check_policy_for_suite
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SQL_KINDS = frozenset({"sql_predicate", "sql_metric"})
 
 
@@ -45,12 +45,19 @@ class Store:
         self.clock = clock
         self.new_id = new_id
 
+    def record_console_audit(self, c, *, dataset_id: str, actor: str, action: str, resource_type: str,
+                             resource_id: str, details: dict) -> None:
+        """Append a console audit event; call only inside the successful mutation's transaction."""
+        c.execute(t.console_audit_events.insert().values(
+            event_id=self.new_id(), dataset_id=dataset_id, actor=actor, action=action, resource_type=resource_type,
+            resource_id=resource_id, occurred_at=self.clock(), details=details))
+
     # ---------- infra ----------
     def check_schema(self) -> None:
         with self.engine.connect() as c:
             ok = c.execute(sa.text("SELECT 1 FROM schema_versions WHERE version = :v"), {"v": SCHEMA_VERSION}).first()
         if not ok:
-            raise RuntimeError("database schema version 2 missing; apply postgres/migrations first")
+            raise RuntimeError("database schema version 3 missing; apply postgres/migrations/003_console_operations.sql first")
 
     def healthy(self) -> bool:
         try:
@@ -222,6 +229,12 @@ class Store:
             elif cur["registration_hash"] != h:
                 c.execute(t.datasets.update().where(t.datasets.c.dataset_id == dataset_id).values(
                     registration=body, registration_hash=h, updated_at=now, updated_by=actor))
+            if cur is None or cur["registration_hash"] != h:
+                self.record_console_audit(c, dataset_id=dataset_id, actor=actor,
+                                          action="dataset.register" if cur is None else "dataset.update",
+                                          resource_type="dataset", resource_id=dataset_id,
+                                          details={"hash_before": cur["registration_hash"] if cur else None,
+                                                   "hash_after": h})
             self._sync_grants(c, dataset_id, registry)
             return 200, {"registration": body, "registration_hash": h}
         return self.tx_retry(run)
@@ -328,6 +341,9 @@ class Store:
             c.execute(t.suites.insert().values(suite_id=s, dataset_id=dataset_id, workflow=body["workflow"],
                                                name=body["name"], description=body["description"],
                                                created_at=self.clock(), created_by=actor))
+            self.record_console_audit(c, dataset_id=dataset_id, actor=actor, action="suite.create",
+                                      resource_type="suite", resource_id=str(s),
+                                      details={"workflow": body["workflow"]})
             return 201, {"suite_id": str(s), "dataset_id": dataset_id, **body}, str(s)
         return self.idempotent(actor, f"POST /datasets/{dataset_id}/suites", dataset_id, key, body, fn)
 
@@ -374,6 +390,10 @@ class Store:
                 c.execute(t.suite_revisions.insert().values(**values))
             else:
                 c.execute(t.policy_revisions.insert().values(**values))
+            self.record_console_audit(c, dataset_id=dataset_id, actor=actor,
+                                      action=f"{kind}_revision.create", resource_type=f"{kind}_revision",
+                                      resource_id=str(rid),
+                                      details={"suite_id": suite_id, "revision_no": no, "content_hash": h})
             row = c.execute(sa.text(f"SELECT * FROM {table} WHERE revision_id=:r"), {"r": rid}).mappings().one()
             return 201, self.revision_view(row, kind), str(rid)
         return self.idempotent(actor, route, dataset_id, key, payload, fn)
@@ -432,6 +452,9 @@ class Store:
                                                  updated_at=now, updated_by=actor))
             row = self._purpose(c, dataset_id, workflow, purpose)
             self._event(c, row, "REGISTER", actor, None, now)
+            self.record_console_audit(c, dataset_id=dataset_id, actor=actor, action="purpose.register",
+                                      resource_type="purpose", resource_id=f"{workflow}/{purpose}",
+                                      details={"state_after": "ACTIVE"})
             return 201, self.purpose_view(row)
         return self.tx_retry(run)
 
@@ -501,6 +524,13 @@ class Store:
                 policy_revision_id=uuid.UUID(body["policy_revision_id"]), updated_at=now, updated_by=actor))
             row = self._purpose(c, dataset_id, workflow, purpose)
             self._event(c, row, "ACTIVATE", actor, body["reason"], now)
+            self.record_console_audit(c, dataset_id=dataset_id, actor=actor, action="binding.activate",
+                                      resource_type="purpose", resource_id=f"{workflow}/{purpose}",
+                                      details={"binding_version_before": row["binding_version"] - 1,
+                                               "binding_version_after": row["binding_version"],
+                                               "suite_id": body["suite_id"],
+                                               "suite_revision_id": body["suite_revision_id"],
+                                               "policy_revision_id": body["policy_revision_id"]})
             return 200, self.purpose_view(row), body["suite_revision_id"]
         return self.idempotent(actor, route, dataset_id, key, body, fn)
 
@@ -642,13 +672,16 @@ class Store:
         return self.idempotent(actor, "POST /executions", req.dataset_id, key, body, fn, isolation="REPEATABLE READ")
 
     def list_executions(self, dataset_id: str, states: list[str], purposes: set[tuple[str, str]] | None,
-                        limit: int, after: tuple[str, str] | None) -> tuple[list[dict], tuple | None]:
+                        limit: int, after: tuple[str, str] | None, *, workflow: str | None = None) -> tuple[list[dict], tuple | None]:
         def run(c):
             q = ["SELECT * FROM executions WHERE dataset_id=:d"]
             params: dict[str, Any] = {"d": dataset_id, "n": limit + 1}
             if states:
                 q.append("AND state = ANY(:states)")
                 params["states"] = states
+            if workflow is not None:
+                q.append("AND workflow = :workflow")
+                params["workflow"] = workflow
             if purposes is not None:
                 if not purposes:
                     return [], None
@@ -742,6 +775,10 @@ class Store:
             self._retire(c, a, "FAILED", b["process_stop"], now, b["error_category"], b["error"])
             c.execute(t.executions.update().where(t.executions.c.execution_id == e["execution_id"]).values(
                 active_attempt_id=None, updated_at=now))
+            self.record_console_audit(c, dataset_id=e["dataset_id"], actor=actor, action="attempt.fail",
+                                      resource_type="attempt", resource_id=attempt_id,
+                                      details={"execution_id": execution_id, "state_before": "RUNNING",
+                                               "state_after": "FAILED", "error_category": b["error_category"]})
             e = self._execution(c, execution_id)
             return 200, {"execution": self._execution_view(c, e),
                          "attempt": self.attempt_view(self._attempt(c, execution_id, attempt_id))}
@@ -765,6 +802,10 @@ class Store:
             c.execute(t.executions.update().where(t.executions.c.execution_id == e["execution_id"]).values(
                 state=b["state"], active_attempt_id=None, publication_state="NOT_APPLICABLE", updated_at=now,
                 error_category="TERMINATED", error={"reason": b["reason"], "client_error": b["error"]}))
+            self.record_console_audit(c, dataset_id=e["dataset_id"], actor=actor, action="execution.terminate",
+                                      resource_type="execution", resource_id=execution_id,
+                                      details={"state_before": e["state"], "state_after": b["state"],
+                                               "attempt_id": sid(e["active_attempt_id"])})
             return 200, self._execution_view(c, self._execution(c, execution_id)), execution_id
         return self.idempotent(actor, f"POST /executions/{execution_id}/terminate", None, key, b, fn)
 
@@ -807,7 +848,11 @@ class Store:
             if self.open_restore(c, e["dataset_id"]):
                 raise ApiError("RESTORE_RECONCILING")
             validate(c, e)
-            return 200, build(c, e)
+            out = build(c, e)
+            self.record_console_audit(c, dataset_id=e["dataset_id"], actor="system", action="report.accept",
+                                      resource_type="report", resource_id=execution_id,
+                                      details={"execution_id": execution_id, "report_hash": report_hash})
+            return 200, out
         return self.tx_retry(run)
 
     # =====================================================================================
@@ -886,6 +931,11 @@ class Store:
                 txn_app_id=intent["txn_app_id"] if intent else None,
                 txn_version=intent["txn_version"] if intent else None))
             self._after_outcome(c, e, rep, now)
+            self.record_console_audit(c, dataset_id=e["dataset_id"], actor=actor, action="outcome.put",
+                                      resource_type="write_outcome", resource_id=f"{execution_id}/{dest}",
+                                      details={"execution_id": execution_id, "destination": dest, "role": role,
+                                               "state_before": o["state"], "state_after": b["state"],
+                                               "outcome_version": o["outcome_version"] + 1})
             return 200, self._outcome_response(c, self._execution(c, execution_id), dest)
         return self.tx(run)
 

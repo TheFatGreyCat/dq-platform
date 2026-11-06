@@ -71,6 +71,21 @@ services:
       retries: 20
     networks: [dq]
 
+  dq-console-worker:
+    build:
+      context: .
+      dockerfile: dq-service/Dockerfile
+    image: dq-demo/dq-service:0.2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      DQ_ALERT_WEBHOOK_URL: ${DQ_ALERT_WEBHOOK_URL:-}
+    secrets: [database_url]
+    command: ["python", "-m", "console_worker"]
+    networks: [dq]
+
   frontend:
     profiles: [ui]
     build:

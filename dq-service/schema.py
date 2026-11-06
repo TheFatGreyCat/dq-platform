@@ -1,4 +1,4 @@
-"""SQLAlchemy Core mirror của postgres/migrations/002_execution_v2.sql (SQL là nguồn chuẩn).
+"""SQLAlchemy Core mirror của postgres/migrations/002_execution_v2.sql + 003_console_operations.sql (SQL là nguồn chuẩn).
 
 Chỉ dùng để dựng truy vấn; KHÔNG gọi metadata.create_all. test_schema_constraints so khớp tên cột với DB thật.
 """
@@ -128,3 +128,26 @@ restore_scans = _table("restore_scans", Column("restore_id", _U(), primary_key=T
 cleanup_records = _table("cleanup_records", Column("cleanup_id", _U(), primary_key=True), Column("dataset_id", Text),
                          Column("execution_id", _U()), Column("attempt_id", _U()), Column("uri", Text),
                          Column("removed_at", _T()), Column("actor", Text), Column("stop_reference", Text))
+
+console_alert_settings = _table("console_alert_settings", Column("dataset_id", Text, primary_key=True),
+                                Column("version", BigInteger), Column("enabled", Boolean),
+                                Column("quarantine_ratio_threshold", Numeric),
+                                Column("no_report_after_seconds", BigInteger),
+                                Column("violation_rate_threshold", Numeric),
+                                Column("violation_rate_min_reports", BigInteger),
+                                Column("window_seconds", BigInteger), Column("updated_at", _T()),
+                                Column("updated_by", Text))
+console_alerts = _table("console_alerts", Column("alert_id", _U(), primary_key=True), Column("dataset_id", Text),
+                        Column("alert_key", Text), Column("kind", Text), Column("execution_id", _U()),
+                        Column("rule_id", Text), Column("window_start", _T()), Column("window_end", _T()),
+                        Column("owner_snapshot", Text), Column("details", JSONB), Column("created_at", _T()),
+                        Column("acknowledged_at", _T()), Column("acknowledged_by", Text),
+                        Column("acknowledgement_note", Text), Column("version", BigInteger))
+console_alert_deliveries = _table("console_alert_deliveries", Column("alert_id", _U(), primary_key=True),
+                                  Column("state", Text), Column("attempts", Integer),
+                                  Column("next_attempt_at", _T()), Column("delivered_at", _T()),
+                                  Column("last_error_code", Text), Column("lease_until", _T()))
+console_audit_events = _table("console_audit_events", Column("event_id", _U(), primary_key=True),
+                              Column("dataset_id", Text), Column("actor", Text), Column("action", Text),
+                              Column("resource_type", Text), Column("resource_id", Text),
+                              Column("occurred_at", _T()), Column("details", JSONB))

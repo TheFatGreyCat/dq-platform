@@ -12,16 +12,16 @@ import binascii
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import requests
 import sqlalchemy as sa
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-import schema as t
+import analytics
+import console_operations as ops
 from anomaly import AnomalyClient, build_observations, history_identity, select_history
 from auth import READ_ROLES, Principal, TokenRegistry, require_dataset, require_execution, require_read
 from budget import check_budget, max_report_bytes
@@ -30,7 +30,8 @@ from errors import ApiError, check_client_error_refs, from_validation_error
 from models import (AbandonRequest, AttemptCreate, AttemptFail, AuditReport, BindingRequest, ClearRequest,
                     CompatManifest, EligibilityRequest, ExecutionRequest, ManifestAcceptance, OutcomeRequest, Policy,
                     PublicationClose, PurposeRegister, Registration, RestoreComplete, RestoreFindings, RetireRequest,
-                    StopConfirmation, Suite, SuiteCreate, TerminateRequest, WriteReport, check_parameter_values)
+                    RevisionValidationRequest, StopConfirmation, Suite, SuiteCreate, TerminateRequest, WORKFLOW_STAGES,
+                    WriteReport, check_parameter_values, check_policy_for_suite)
 from plan import compile_plan, plan_rules
 from policy import evaluate
 from store import Store, sid, ts
@@ -189,6 +190,40 @@ def create_app(store: Store, token_registry: TokenRegistry, anomaly_client: Anom
             raise ApiError("INVALID_CONFIG", "Idempotency-Key")
         return k
 
+    def analytics_window(request: Request) -> tuple[datetime, datetime]:
+        now = datetime.now(timezone.utc)
+        raw_from = request.query_params.get("from")
+        raw_to = request.query_params.get("to")
+        try:
+            end = datetime.fromisoformat(raw_to.replace("Z", "+00:00")) if raw_to else now
+            start = datetime.fromisoformat(raw_from.replace("Z", "+00:00")) if raw_from else end - timedelta(days=7)
+        except (AttributeError, ValueError):
+            raise ApiError("INVALID_CONFIG", "from")
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ApiError("INVALID_CONFIG", "from")
+        start = start.astimezone(timezone.utc)
+        end = end.astimezone(timezone.utc)
+        if start >= end or end - start > timedelta(days=90):
+            raise ApiError("INVALID_CONFIG", "to")
+        return start, end
+
+    def analytics_filters(request: Request) -> tuple[str | None, str | None]:
+        workflow = request.query_params.get("workflow")
+        purpose = request.query_params.get("purpose")
+        if workflow is not None and workflow not in ("WRITE_GATE", "AUDIT_TABLE"):
+            raise ApiError("INVALID_CONFIG", "workflow")
+        if purpose and workflow is None:
+            raise ApiError("INVALID_CONFIG", "purpose")
+        return workflow, purpose
+        k = request.headers.get("idempotency-key")
+        if k is None:
+            if required:
+                raise ApiError("INVALID_CONFIG", "Idempotency-Key")
+            return None
+        if not (1 <= len(k) <= 128) or not k.isascii() or not k.isprintable():
+            raise ApiError("INVALID_CONFIG", "Idempotency-Key")
+        return k
+
     def exec_ctx(p: Principal, execution_id: str, op: str) -> tuple[dict, str]:
         e = store.execution_row(execution_id)
         return e, require_execution(p, e, op)
@@ -303,6 +338,24 @@ def create_app(store: Store, token_registry: TokenRegistry, anomaly_client: Anom
     def get_suite(dataset_id: str, suite_id: str, request: Request):
         require_read(principal(request), dataset_id)
         return store.get_suite(dataset_id, suite_id)
+
+    @app.post(API + "/datasets/{dataset_id}/suites/{suite_id}/validate")
+    async def validate_suite_revision(dataset_id: str, suite_id: str, request: Request):
+        p = principal(request)
+        require_dataset(p, dataset_id, {"editor"})
+        suite_meta = store.get_suite(dataset_id, suite_id)
+        b = model(RevisionValidationRequest, await body_json(request))
+        if b.suite.workflow is not None and b.suite.workflow != suite_meta["workflow"]:
+            raise ApiError("INVALID_CONFIG", "suite.workflow")
+        expected_stages = WORKFLOW_STAGES[suite_meta["workflow"]]
+        if any(r.stage not in expected_stages for r in b.suite.rules):
+            raise ApiError("INVALID_CONFIG", "suite.rules")
+        if b.policy is not None:
+            try:
+                check_policy_for_suite(b.suite, b.policy)
+            except ValueError:
+                raise ApiError("INVALID_CONFIG", "policy")
+        return {"valid": True, "contains_sql": b.suite.contains_sql}
 
     @app.post(API + "/datasets/{dataset_id}/suites/{suite_id}/revisions")
     async def create_suite_revision(dataset_id: str, suite_id: str, request: Request):
@@ -451,13 +504,49 @@ def create_app(store: Store, token_registry: TokenRegistry, anomaly_client: Anom
         states = request.query_params.getlist("state")
         if any(s not in _STATES for s in states):
             raise ApiError("INVALID_CONFIG", "state")
+        workflows = request.query_params.getlist("workflow")
+        workflow = workflows[0] if len(workflows) == 1 else None
+        if workflows and (len(workflows) != 1 or workflow not in ("WRITE_GATE", "AUDIT_TABLE")):
+            raise ApiError("INVALID_CONFIG", "workflow")
         purposes = None if p.roles(dataset_id) & READ_ROLES else p.job_purposes(dataset_id)
         cur = _cursor_decode(request.query_params.get("cursor"))
         if cur is not None and not (isinstance(cur, list) and len(cur) == 2):
             raise ApiError("INVALID_CONFIG", "cursor")
         items, nxt = store.list_executions(dataset_id, states, purposes, _limit(request.query_params.get("limit")),
-                                           tuple(cur) if cur else None)
+                                           tuple(cur) if cur else None, workflow=workflow)
         return {"items": items, "next_cursor": _cursor_encode(list(nxt) if nxt else None)}
+
+    @app.get(API + "/datasets/{dataset_id}/analytics")
+    def dataset_analytics(dataset_id: str, request: Request):
+        require_read(principal(request), dataset_id)
+        start, end = analytics_window(request)
+        workflow, purpose = analytics_filters(request)
+        return store.tx(lambda c: analytics.aggregate_dataset(c, dataset_id, start, end, workflow, purpose))
+
+    @app.get(API + "/analytics")
+    def global_analytics(request: Request):
+        p = principal(request)
+        requested = set(request.query_params.getlist("dataset_id"))
+        granted = {g.dataset_id for g in p.grants if g.role in READ_ROLES}
+        if requested - granted:
+            raise ApiError("FORBIDDEN")
+        start, end = analytics_window(request)
+        workflow, purpose = analytics_filters(request)
+        datasets = [store.tx(lambda c, d=d: analytics.aggregate_dataset(c, d, start, end, workflow, purpose)) for d in sorted(requested or granted)]
+        return {"window": {"start": canonical_timestamp(start), "end": canonical_timestamp(end)}, "datasets": datasets}
+
+    @app.get(API + "/datasets/{dataset_id}/rule-history")
+    def dataset_rule_history(dataset_id: str, request: Request):
+        require_read(principal(request), dataset_id)
+        start, end = analytics_window(request)
+        metric_hash = request.query_params.get("metric_definition_hash")
+        scope = request.query_params.get("scope")
+        stage = request.query_params.get("stage")
+        history_hash = request.query_params.get("history_identity_hash")
+        if not all((metric_hash, scope, stage, history_hash)):
+            raise ApiError("INVALID_CONFIG", "metric_definition_hash")
+        limit = _limit(request.query_params.get("limit"))
+        return store.tx(lambda c: analytics.rule_history(c, dataset_id, metric_hash, scope, stage, history_hash, start, end, limit))
 
     @app.get(API + "/executions/{execution_id}")
     def get_execution(execution_id: str, request: Request):
@@ -494,7 +583,7 @@ def create_app(store: Store, token_registry: TokenRegistry, anomaly_client: Anom
 
     # ---------- reports ----------
     @app.post(API + "/executions/{execution_id}/reports")
-    async def post_report(execution_id: str, request: Request, background: BackgroundTasks):
+    async def post_report(execution_id: str, request: Request):
         p = principal(request)
         e, _ = exec_ctx(p, execution_id, "job")
         raw = await body_json(request)
@@ -529,8 +618,6 @@ def create_app(store: Store, token_registry: TokenRegistry, anomaly_client: Anom
             return _persist_report(c, ex, rep, payload, report_hash, assessment, anomaly_obs, accepted)
 
         status, resp = store.accept_report(execution_id, report_hash, payload, validate=validate, build=build)
-        if accepted["alert"] and alert_webhook_url:
-            background.add_task(_alert, alert_webhook_url, resp, e)
         return _jr(status, resp)
 
     def _validate_report(plan: dict, rep) -> None:
@@ -782,6 +869,47 @@ def create_app(store: Store, token_registry: TokenRegistry, anomaly_client: Anom
             raise ApiError("INVALID_CONFIG", "dt")
         return store.publications(dataset_id, dt)
 
+    # ---------- console operations ----------
+    @app.get(API + "/datasets/{dataset_id}/alert-settings")
+    def get_alert_settings(dataset_id: str, request: Request):
+        require_read(principal(request), dataset_id)
+        return store.tx(lambda c: ops.get_settings(c, store, dataset_id))
+
+    @app.put(API + "/datasets/{dataset_id}/alert-settings")
+    async def put_alert_settings(dataset_id: str, request: Request):
+        p = principal(request)
+        require_dataset(p, dataset_id, {"operator"})
+        key = idem_key(request)
+        b = model(ops.AlertSettingsPut, await body_json(request))
+        return _jr(*store.idempotent(p.name, f"PUT /datasets/{dataset_id}/alert-settings", dataset_id, key,
+                                     b.model_dump(), lambda c: ops.put_settings(c, store, p.name, dataset_id, b)))
+
+    @app.get(API + "/datasets/{dataset_id}/alerts")
+    def list_alerts(dataset_id: str, request: Request):
+        require_read(principal(request), dataset_id)
+        cur, limit = collection_page(request, list)
+        q = request.query_params
+        items, nxt = store.tx(lambda c: ops.list_alerts(c, store, dataset_id, q.get("state"), q.get("kind"), limit, cur))
+        return {"items": items, "next_cursor": _cursor_encode(nxt)}
+
+    @app.post(API + "/datasets/{dataset_id}/alerts/{alert_id}/acknowledgement")
+    async def acknowledge_alert(dataset_id: str, alert_id: str, request: Request):
+        p = principal(request)
+        require_dataset(p, dataset_id, {"operator"})
+        key = idem_key(request)
+        b = model(ops.AlertAck, await body_json(request))
+        return _jr(*store.idempotent(p.name, f"POST /datasets/{dataset_id}/alerts/{alert_id}/acknowledgement",
+                                     dataset_id, key, b.model_dump(),
+                                     lambda c: ops.acknowledge(c, store, p.name, dataset_id, alert_id, b)))
+
+    @app.get(API + "/datasets/{dataset_id}/audit-events")
+    def list_audit_events(dataset_id: str, request: Request):
+        require_dataset(principal(request), dataset_id, READ_ROLES)
+        cur, limit = collection_page(request, list)
+        items, nxt = store.tx(lambda c: ops.list_audit_events(
+            c, store, dataset_id, request.query_params.get("action"), limit, cur))
+        return {"items": items, "next_cursor": _cursor_encode(nxt)}
+
     # ---------- restore ----------
     @app.get(API + "/datasets/{dataset_id}/restore")
     def get_restore(dataset_id: str, request: Request):
@@ -832,15 +960,6 @@ def create_app(store: Store, token_registry: TokenRegistry, anomaly_client: Anom
     return app
 
 
-def _alert(url: str, resp: dict, e: dict) -> None:
-    d = resp.get("decision") or {}
-    text = (f"DQ dataset={e['dataset_id']} execution={resp['execution_id']} decision={d.get('decision')} "
-            f"assessment={resp.get('assessment')} reasons="
-            + ",".join(f"{r['code']}:{r['rule_id'] or '-'}" for r in d.get("reasons", [])))
-    try:
-        requests.post(url, json={"text": text}, timeout=5)
-    except requests.RequestException:
-        log.error("alert webhook failed code=ALERT_DELIVERY_FAILED")
 
 
 def _ident(s: str) -> bool:

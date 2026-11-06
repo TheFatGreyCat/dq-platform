@@ -810,6 +810,11 @@ class SuiteCreate(_Model):
     description: Text | None
 
 
+class RevisionValidationRequest(_Model):
+    suite: Suite
+    policy: Policy | None = None
+
+
 class PurposeRegister(_Model):
     description: Text | None
 

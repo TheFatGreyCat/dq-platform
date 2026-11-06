@@ -84,3 +84,36 @@ def test_revision_purpose_and_accepted_manifest_collections(console_env):
     assert [item["manifest"]["manifest_id"] for item in accepted["items"]] == [manifest_id]
     assert accepted["items"][0]["acceptance"]["dataset_id"] == DS
     assert client.get(f"/api/v2/datasets/{DS}/suites?cursor=not-base64!", headers=H(tokens, "viewer")).status_code == 422
+def test_execution_workflow_filter_validates_and_intersects_state(console_env):
+    from .test_execution_acceptance import setup_gate, start
+
+    client, tokens = console_env
+    reg, mid, *_ = setup_gate(client, tokens)
+    first, _, _ = start(client, tokens, reg, mid, event_time="2026-10-20T00:00:00Z")
+    second, _, _ = start(client, tokens, reg, mid, event_time="2026-10-20T00:01:00Z")
+    headers = H(tokens, "viewer")
+
+    filtered = client.get(f"/api/v2/datasets/{DS}/executions?workflow=WRITE_GATE&state=PLANNED",
+                          headers=headers)
+    assert filtered.status_code == 200
+    assert [item["execution_id"] for item in filtered.json()["items"]] == [first, second]
+    empty = client.get(f"/api/v2/datasets/{DS}/executions?workflow=AUDIT_TABLE", headers=headers)
+    assert empty.status_code == 200 and empty.json()["items"] == []
+    for query in ("workflow=", "workflow=invalid", "workflow=WRITE_GATE&workflow=AUDIT_TABLE"):
+        response = client.get(f"/api/v2/datasets/{DS}/executions?{query}", headers=headers)
+        assert response.status_code == 422
+        assert response.json()["error"]["field"] == "workflow"
+    first_page = client.get(f"/api/v2/datasets/{DS}/executions?workflow=WRITE_GATE&limit=1", headers=headers).json()
+    assert [item["execution_id"] for item in first_page["items"]] == [first]
+    second_page = client.get(
+        f"/api/v2/datasets/{DS}/executions?workflow=WRITE_GATE&limit=1&cursor={first_page['next_cursor']}",
+        headers=headers,
+    ).json()
+    assert [item["execution_id"] for item in second_page["items"]] == [second]
+    assert second_page["next_cursor"] is None
+    job_page = client.get(f"/api/v2/datasets/{DS}/executions?workflow=AUDIT_TABLE", headers=H(tokens, "job_only"))
+    assert job_page.status_code == 200 and job_page.json()["items"] == []
+    assert client.get(f"/api/v2/datasets/silver.unregistered/executions?workflow=bad",
+                      headers=headers).status_code == 403
+    assert client.get(f"/api/v2/datasets/{DS2}/executions?workflow=AUDIT_TABLE",
+                      headers=headers).status_code == 404

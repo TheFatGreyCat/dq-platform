@@ -52,3 +52,6 @@ CREATE INDEX IF NOT EXISTS idx_dq_rule_id  ON dq_rule_results (dataset, rule_id,
 
 -- Schema v2 (execution/registry bất biến), cạnh các bảng legacy ở trên; không đụng dữ liệu legacy.
 \ir migrations/002_execution_v2.sql
+
+-- Schema v3 (console operations: alert settings/inbox/delivery, audit events).
+\ir migrations/003_console_operations.sql
