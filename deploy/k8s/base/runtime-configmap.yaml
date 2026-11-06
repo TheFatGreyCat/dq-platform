@@ -4,7 +4,7 @@ metadata:
   name: dq-runtime
 data:
   # Overlay PHẢI đặt image theo digest (@sha256:...) ở production: compat manifest đã accept gắn với đúng jar
-  spark_image: dq-platform/spark:0.3.0
+  spark_image: dq-platform/spark:finance-10g-20261106T003633Z
   s3_endpoint: http://minio:9000
   # state dir của DQ client (handle/report từng attempt) phải sống lâu hơn pod driver -> object store
   state_dir: s3a://dq-lake/_dq_state
