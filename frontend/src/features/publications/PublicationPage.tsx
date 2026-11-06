@@ -15,6 +15,6 @@ export function PublicationPage() {
       <button className="primary" disabled={!dt || query.isFetching} onClick={() => void query.refetch()}>Tải publication</button></div>
     {query.isFetching && <LoadingState />}{query.isError && <ApiErrorAlert error={query.error} retry={() => void query.refetch()} />}
     {query.data && <div className="card"><pre>{JSON.stringify(query.data, null, 2)}</pre>{query.data.current === null && <EmptyState title="Chưa có publication hiện tại" />}
-      {Boolean(query.data.restore_orphans) ? <div role="alert">Có restore/orphan marker; cần xử lý qua operator tools.</div> : null}</div>}
+      {query.data.restore_orphans.length > 0 && <div role="alert">Có restore/orphan marker; cần xử lý qua operator tools.</div>}</div>}
   </div>;
 }

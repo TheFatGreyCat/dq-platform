@@ -1,8 +1,4 @@
-@import '@fontsource/sarabun/400.css';
-@import '@fontsource/sarabun/500.css';
-@import '@fontsource/sarabun/600.css';
-@import '@fontsource/sarabun/700.css';
-@import '@fontsource/roboto-mono/400.css';
+@import './fonts.css';
 
 :root {
   font-family: 'Sarabun', sans-serif;

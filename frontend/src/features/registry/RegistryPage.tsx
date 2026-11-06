@@ -3,18 +3,21 @@ import { Link, useParams } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiRequest } from '../../api/client';
 import { endpoints } from '../../api/endpoints';
-import type { Revision } from '../../api/types';
+import type { Revision, Workflow } from '../../api/types';
+import { SuiteBuilder } from './SuiteBuilder';
+import { RevisionDiff } from './RevisionDiff';
 import { ApiErrorAlert, EmptyState, Field, LoadingState, PageHeader } from '../../components/Primitives';
 
 export function RegistryPage() {
   const { datasetId = '', '*': route = '' } = useParams();
   const dataset = decodeURIComponent(datasetId);
-  if (route.startsWith('suites/')) return <SuitePage dataset={dataset} suite={route.split('/')[1] ?? ''} />;
   if (route === 'registration') return <RegistrationPage dataset={dataset} />;
+  if (route === 'purposes') return <PurposesPage dataset={dataset} />;
   if (route.startsWith('purposes/')) return <PurposeDetail dataset={dataset} route={route} />;
-  if (route.startsWith('purposes')) return <PurposesPage dataset={dataset} />;
   if (route === 'compatibility') return <CompatibilityPage dataset={dataset} />;
-  return <SuitesPage dataset={dataset} />;
+  if (route === 'suites') return <SuitesPage dataset={dataset} />;
+  if (route.startsWith('suites/') && route.split('/').length === 2 && route.split('/')[1]) return <SuitePage dataset={dataset} suite={route.slice('suites/'.length)} />;
+  return <div className="card stack" role="status"><h1>Page not found</h1><p>Unknown dataset route: {route}</p><Link to="/datasets">Datasets</Link></div>;
 }
 
 function SuitesPage({ dataset }: { dataset: string }) {
@@ -36,23 +39,58 @@ function SuitesPage({ dataset }: { dataset: string }) {
 function SuitePage({ dataset, suite }: { dataset: string; suite: string }) {
   const [kind, setKind] = useState<'revisions' | 'policy-revisions'>('revisions');
   const [selected, setSelected] = useState('');
-  const [draft, setDraft] = useState('');
+  const [activeTab, setActiveTab] = useState<'builder' | 'diff'>('builder');
+  const [clonedPayload, setClonedPayload] = useState<Record<string, unknown> | null>(null);
+  const suiteMeta = useQuery({ queryKey: ['suite-meta', dataset, suite], queryFn: ({ signal }) => endpoints.suite(dataset, suite, signal).then(r => r.data) });
   const list = useQuery({ queryKey: ['revisions', dataset, suite, kind], queryFn: ({ signal }) => endpoints.collection<Revision>(dataset, `suites/${encodeURIComponent(suite)}/${kind}`, null, signal).then(r => r.data) });
   const detail = useQuery({ queryKey: ['revision', dataset, suite, kind, selected], enabled: Boolean(selected), queryFn: ({ signal }) => endpoints.revision(dataset, suite, kind, selected, signal).then(r => r.data) });
-  const create = useMutation({ mutationFn: () => {
-    const parsed: unknown = JSON.parse(draft);
-    if (!draft.trim() || new TextEncoder().encode(draft).length > 1_048_576 || !parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('Cần JSON object tối đa 1 MiB.');
-    return apiRequest<Revision>(`/api/v2/datasets/${encodeURIComponent(dataset)}/suites/${encodeURIComponent(suite)}/${kind}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() }, body: draft,
-    });
-  }, onSuccess: async result => { await list.refetch(); setSelected(result.data.revision_id); } });
-  if (list.isPending) return <LoadingState />;
+
+  if (suiteMeta.isPending || list.isPending) return <LoadingState />;
+  if (suiteMeta.isError) return <ApiErrorAlert error={suiteMeta.error} retry={() => void suiteMeta.refetch()} />;
   if (list.isError) return <ApiErrorAlert error={list.error} retry={() => void list.refetch()} />;
-  return <div className="stack"><PageHeader title={`Suite ${suite}`} description="Chọn revision cụ thể; lưu revision mới để thay đổi." />
-    <div className="row"><button onClick={() => { setKind('revisions'); setSelected(''); }}>Suite revisions</button><button onClick={() => { setKind('policy-revisions'); setSelected(''); }}>Policy revisions</button></div>
-    <div className="row">{list.data.items.map(r => <button key={r.revision_id} onClick={() => setSelected(r.revision_id)}>r{r.revision_no} · {r.content_hash.slice(0, 12)}</button>)}</div>
-    {detail.data && <div className="card"><p>{detail.data.created_by} · {detail.data.content_hash} {detail.data.contains_sql ? '· contains SQL' : ''}</p><pre>{JSON.stringify(detail.data.payload, null, 2)}</pre></div>}
-    <div className="card stack"><h2>Tạo revision</h2><Field label="JSON payload, tối đa 1 MiB">{id => <textarea id={id} rows={12} value={draft} onChange={e => setDraft(e.target.value)} />}</Field><div className="row"><button onClick={() => detail.data && setDraft(JSON.stringify(detail.data.payload, null, 2))}>Clone revision</button><button className="primary" disabled={!draft.trim() || create.isPending} onClick={() => create.mutate()}>Tạo revision</button></div>{create.isError && <ApiErrorAlert error={create.error} />}{create.isSuccess && <p role="status">{create.data.status === 200 ? 'Revision đã tồn tại; chọn revision gốc.' : 'Đã tạo revision.'}</p>}</div>
+
+  const workflow = ((suiteMeta.data?.workflow as Workflow) ?? 'WRITE_GATE');
+
+  return <div className="stack">
+    <PageHeader title={`Suite: ${String(suiteMeta.data?.name ?? suite)}`} description={`Workflow: ${workflow} · ID: ${suite}`} />
+    <div className="row" style={{ gap: 8, borderBottom: '1px solid var(--border)', paddingBottom: 12 }}>
+      <button type="button" className={activeTab === 'builder' ? 'primary' : ''} onClick={() => setActiveTab('builder')}>Soạn thảo & Revisions</button>
+      <button type="button" className={activeTab === 'diff' ? 'primary' : ''} onClick={() => setActiveTab('diff')}>So sánh Revisions (Diff)</button>
+    </div>
+    {activeTab === 'diff' ? <RevisionDiff dataset={dataset} suiteId={suite} /> : <>
+    <div className="card stack">
+      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+        <div className="row" style={{ gap: 8 }}>
+          <button className={kind === 'revisions' ? 'primary' : ''} onClick={() => { setKind('revisions'); setSelected(''); }}>Suite revisions</button>
+          <button className={kind === 'policy-revisions' ? 'primary' : ''} onClick={() => { setKind('policy-revisions'); setSelected(''); }}>Policy revisions</button>
+        </div>
+        <Link to={`/datasets/${encodeURIComponent(dataset)}/purposes`} style={{ fontSize: 14 }}>Xem mục Purposes & Bindings →</Link>
+      </div>
+      <div className="row" style={{ flexWrap: 'wrap', gap: 8 }}>
+        {list.data.items.length === 0 ? <span style={{ color: 'var(--muted)', fontSize: 13 }}>Chưa có revision nào.</span> :
+          list.data.items.map(r => <button key={r.revision_id} className={selected === r.revision_id ? 'primary' : ''} onClick={() => setSelected(r.revision_id)}>r{r.revision_no} · {r.content_hash.slice(0, 12)}</button>)}
+      </div>
+      {detail.data && <div className="card stack" style={{ background: 'var(--surface-muted, #f8fafc)', border: '1px solid var(--border)' }}>
+        <div className="row" style={{ justifyContent: 'space-between' }}>
+          <b>r{detail.data.revision_no} · {detail.data.created_by} · {detail.data.content_hash} {detail.data.contains_sql ? '· contains SQL' : ''}</b>
+          <button type="button" onClick={() => setClonedPayload(detail.data.payload)}>Clone vào form soạn thảo</button>
+        </div>
+        <pre className="mono" style={{ maxHeight: 200, overflow: 'auto' }}>{JSON.stringify(detail.data.payload, null, 2)}</pre>
+      </div>}
+    </div>
+
+    <SuiteBuilder
+      dataset={dataset}
+      suiteId={suite}
+      workflow={workflow}
+      clonedPayload={clonedPayload}
+      onSavedRevision={(savedKind, id) => {
+        setKind(savedKind);
+        setSelected(id);
+        void list.refetch();
+      }}
+    />
+    </>}
   </div>;
 }
 
